@@ -1,0 +1,131 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A single cross-platform PowerShell 7.2+ script, `New-BcEnvironment.ps1`, that creates a Business Central
+environment with Docker or Podman Compose on Windows, Linux and macOS. It then publishes `.app`
+extensions in a given order. It wraps upstream
+[MsDyn365Bc.On.Linux](https://github.com/aldevtools/MsDyn365Bc.On.Linux) (BC service tier patched to run
+on Linux) and **must keep using upstream's compose files**: the user prefers that over driving
+`docker run` directly. User-facing usage lives in `README.md`; findings, work in progress and backlog
+live in `docs/ROADMAP.md`. Keep both in sync when behaviour changes. In particular, the README
+settings table must list every parameter and env-file key.
+
+## Commands
+
+There is no build, linter or unit-test suite. Validation is a parse check plus a real end-to-end run.
+
+```bash
+# Parse check (run after every edit)
+pwsh -NoProfile -Command '$e=$null;$null=[System.Management.Automation.Language.Parser]::ParseFile("$PWD/New-BcEnvironment.ps1",[ref]$null,[ref]$e); if($e){$e}else{"parse OK"}'
+
+# End-to-end run on the test bench (≈9 min: ~3 min boot, ~6 min LS apps). Run it in the background.
+pwsh -NoProfile -File ./New-BcEnvironment.ps1 -EnvFile ./bc285-lscentral.env [-Recreate]
+
+# Tear down (compose down -v + label-based cleanup + ~/.bcvm/<Name>)
+pwsh -NoProfile -File ./New-BcEnvironment.ps1 -Name bc285 -Remove
+
+# Manage a running environment directly (the script prints this command; macOS overlay only on ARM)
+docker compose -p bc285 -f ~/.bcvm/MsDyn365Bc.On.Linux/docker-compose.yml \
+  -f ~/.bcvm/MsDyn365Bc.On.Linux/docker-compose.macos.yml -f ~/.bcvm/bc285/compose.override.yml \
+  --env-file ~/.bcvm/bc285/compose.env <ps|stop|start|restart bc|logs -f bc>
+
+# Readiness and extensions (default login BCRUNNER / Admin123!)
+curl -s -u 'BCRUNNER:Admin123!' http://localhost:7048/BC/ODataV4/Company
+# automation API: companies(<id>)/extensions — note isInstalled is NOT filterable server-side
+```
+
+To read upstream behaviour (env vars, entrypoint steps, publish rules), look at the cached clone in
+`~/.bcvm/MsDyn365Bc.On.Linux`: `docker-compose.yml`, `docker-compose.macos.yml`,
+`scripts/entrypoint.sh`, `scripts/publish-app.sh`, `KNOWN-LIMITATIONS.md`.
+
+## Script architecture
+
+The script runs top to bottom in sections:
+
+1. Settings resolution
+2. Engine and compose detection
+3. Remove
+4. Validation
+5. Upstream repo
+6. Generated compose files
+7. Start
+8. Wait
+9. Extensions
+10. Summary
+
+Cross-cutting rules:
+
+- **Settings precedence:** `$defaults` < `-EnvFile` < `BCVM_<KEY>` env vars < bound parameters.
+  - `$keyMap` maps env-file keys (upstream's names, e.g. `BC_LICENSE_HOST_PATH`) to setting names.
+  - `ConvertTo-Setting` handles typing (bool/int/`;`-lists).
+  - Unknown env-file keys and `-ContainerEnv` are passed straight to the BC container.
+  - Adding a setting means touching: `param()`, `$defaults`, `$keyMap`, `ConvertTo-Setting` (if
+    typed), the compose env/override generation, and the README table.
+- **Compose layering:**
+  - Files: upstream `docker-compose.yml`, plus `docker-compose.macos.yml` when emulated, plus the
+    generated `~/.bcvm/<Name>/compose.override.yml`.
+  - `--env-file ~/.bcvm/<Name>/compose.env` passes settings by upstream variable names.
+  - The file list is persisted in `compose-files.txt` so `-Remove` uses the same set.
+  - The project name is `-Name`; containers are found by `com.docker.compose.*` labels, not by
+    fixed names.
+- **Generated file quoting:**
+  - `compose.env` values are single-quoted, so compose does not interpolate `$`; values with
+    `'` are rejected.
+  - YAML scalars are emitted as JSON strings with `$` doubled.
+  - The SQL tmpfs is removed with `tmpfs: !reset []`, which needs Compose ≥ 2.24.
+- **`Invoke-Engine` / `Invoke-Compose` must stay plain functions using `$args`.** As advanced
+  functions with `ValueFromRemainingArguments`, PowerShell binds engine flags like `-a` to itself
+  ("positional parameter cannot be found").
+- **Emulation:**
+  - Detected from the host OS architecture or the engine architecture; `bc-runner` is
+    `linux/amd64` only.
+  - When emulated, the script adds upstream's macOS overlay (SQL 2022 CU17).
+  - It also injects `DOTNET_INTERNAL_ThreadSuspendInjection=0` and `DOTNET_GCHeapCount=2`.
+    Without them the NST crashes under Rosetta with `rt_tgsigqueueinfo failed` (exit 133).
+- **Readiness** requires both `/tmp/bc-ready` in the BC container **and** an OData `/Company` answer.
+  The marker survives a container restart until the entrypoint clears it, so never trust it alone.
+- **Extension publish:**
+  - Endpoint: dev endpoint `.../BC/dev/apps?SchemaUpdateMode=forcesync`, in the given order.
+  - Success: HTTP 200, or a benign 422, using the same regex as upstream `publish-app.sh`.
+  - Dependency-looking failures are deferred and retried in another pass; anything else throws.
+- **Persistence:** SQL data lives in the `sql-data` volume (SQL runs as `0:0`). The upstream
+  entrypoint reuses an existing `CRONUS` DB, so stop/start keeps installed apps.
+
+## Environment facts (this machine: Apple Silicon, Docker Desktop)
+
+- **CLI pulls from ghcr fail** with a keychain credential-helper error in non-interactive shells. The
+  script warns and uses cached images. Pulling via the engine API socket
+  (`~/.docker/run/docker.sock`, `POST /images/create`) works.
+- **LS Retail apps need the partner license** (`BC_LICENSE_HOST_PATH`; the `.bclicense` sits in the
+  repo root, git-ignored).
+- **Never swap the SQL container under a running BC tier.** It broke the NST task scheduler
+  connection. Recreate the stack, or at least restart `bc` afterwards.
+- **First boot and big publishes are slow under emulation:** boot ~3 min, LS Central publish
+  220–300 s. Run long commands in the background and poll for the result.
+
+## Work in progress: configuration packages
+
+Read `docs/ROADMAP.md` first. Summary:
+
+- **Order:** BC `EXTENDED` package → enable feature `SalesPrices` → LS `NO-01`, `NO-02`, `NO-02A`,
+  `NO-03` … `NO-11` → pharmacy `LSPH_0`, `LSPH_DEFAULT_DATA`, `LSPH_DISPENSE`, `LSPH_DEMO_DATA` →
+  retail images (UI only).
+- **Mechanism:** automation API v2.0:
+  - `automationCompanies` (create)
+  - `configurationPackages` (create → `PATCH file('{code}')/content` → `Microsoft.NAV.import` /
+    `apply`)
+  - `features(...)/Microsoft.NAV.activate`
+- **Company creation needs SQL Full-Text Search.** On ARM use the locally built CU17 FTS image
+  (`experiments/mssql-fts/Dockerfile`, tag `bcvm/mssql:2022-CU17-fts`); upstream's `2022-fts` is
+  built on `2022-latest`, which crashes under Rosetta.
+- **Open blocker:** the import is queued as a background task and stays `Scheduled`; background
+  tasks have not been seen running on this tier. Unresolved; next steps are in the roadmap.
+
+## Repository hygiene
+
+`experiments/`, `apps/`, `*.app`, `*.bclicense`, `*.rapidstart` and the LS Retail release folders
+are git-ignored and must stay unpublished (proprietary / licensed content). Work there freely, but
+don't reference those files from tracked docs as if they were part of the repo; mark them local only.

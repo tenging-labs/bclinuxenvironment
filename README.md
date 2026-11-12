@@ -1,0 +1,278 @@
+# bcvm: Business Central environments in Docker or Podman
+
+`New-BcEnvironment.ps1` creates a Microsoft Dynamics 365 Business Central environment in a
+local container engine. It then installs your extensions (`.app` files) in the order you
+give them. One PowerShell script works the same way on Windows, Linux and macOS.
+
+It is built on [MsDyn365Bc.On.Linux](https://github.com/aldevtools/MsDyn365Bc.On.Linux),
+which runs the unmodified BC service tier on Linux. The script uses that project's
+supported workflow (`docker compose up`) and adds what the upstream workflow leaves to you:
+
+- picks the container engine and compose command
+- handles emulation on ARM machines
+- supports a partner license
+- keeps the database across restarts
+- publishes extensions in order and verifies they are installed
+- creates and removes environments by name
+
+Work in progress (configuration packages and other open items) is tracked in
+[docs/ROADMAP.md](docs/ROADMAP.md).
+
+---
+
+## Quick start
+
+```powershell
+# BC 28.5 W1 with the web client and LS Central, as defined in an env file
+./New-BcEnvironment.ps1 -EnvFile ./bc285-lscentral.env
+
+# Same thing with parameters only
+./New-BcEnvironment.ps1 -Name bc285 -BcVersion 28.5 -Country w1 -WebClient `
+    -LicenseFile ./BC28_1272026_6205373.bclicense `
+    -Apps './apps/LS Retail_LS Central System App_28.2.0.1847_runtime.app',
+          './apps/LS Retail_LS Central_28.2.0.1847.app',
+          './apps/LS Retail_LS Central for pharmacies_28.1.0.1199.app'
+
+# Remove it again (containers, network, volumes, state)
+./New-BcEnvironment.ps1 -Name bc285 -Remove
+```
+
+When the script finishes, it prints the endpoints:
+
+| What          | Default URL / value                       |
+|---------------|-------------------------------------------|
+| Web client    | http://localhost:8080/ (only with `-WebClient`) |
+| Dev endpoint  | http://localhost:7049/BC/dev (publish apps, download symbols) |
+| OData v4      | http://localhost:7048/BC/ODataV4          |
+| API v2.0      | http://localhost:7052/BC/api/v2.0         |
+| Management    | http://localhost:7045/BC/Management       |
+| Client services (WebSocket) | ws://localhost:7085/BC      |
+| SQL Server    | `localhost,11433`, user `sa`              |
+| BC login      | `BCRUNNER` / `Admin123!` (NavUserPassword, SUPER) |
+
+---
+
+## Requirements
+
+| Requirement | Notes |
+|---|---|
+| PowerShell 7.2+ (`pwsh`) | Windows PowerShell 5.1 is not supported (the script uses `Invoke-WebRequest -Form`). |
+| Docker **or** Podman, running | Detected automatically; Docker is tried first. Override with `-Engine`. |
+| Compose v2 | `docker compose`, `podman compose` (with `docker-compose` as its provider) or a standalone `docker-compose`. |
+| `git` (optional) | Fetches the upstream repo. Without git, the script downloads a zip from GitHub instead. |
+| Memory | About 6 GB free for the containers (SQL 3 GB + BC 2–3 GB). On Docker Desktop / podman machine, give the VM 12–16 GB. |
+| Disk | About 5 GB per environment (artifacts, service tier, database), plus about 2 GB of images. |
+
+### Apple Silicon / ARM hosts
+
+The BC runner image is `linux/amd64` only, so on ARM it runs under emulation. The script
+detects this and applies the needed fixes automatically (see
+[What the script does](#what-the-script-does)).
+
+- **Docker Desktop:** enable *Use Rosetta for x86_64/amd64 emulation* in Settings → General.
+- **Podman:** the machine must be **rootful** and created with Rosetta enabled. See
+  upstream [MacOS.md](https://github.com/aldevtools/MsDyn365Bc.On.Linux/blob/master/MacOS.md).
+  The script warns if the podman machine is rootless.
+
+---
+
+## Configuration
+
+Every setting can come from four places. Later ones win:
+
+1. built-in defaults
+2. an env file passed with `-EnvFile` (`KEY=VALUE` lines, `#` comments)
+3. `BCVM_<KEY>` environment variables (e.g. `BCVM_BC_VERSION=28.4`)
+4. script parameters
+
+Relative paths in an env file (apps, license) are resolved against the env file's folder.
+
+### Settings
+
+| Parameter | Env file key | Default | Description |
+|---|---|---|---|
+| `-Name` | `NAME` | `bc` | Environment name = compose project name. Lowercase letters, digits, `_`, `-`. Containers are `<Name>-bc-1` and `<Name>-sql-1`. |
+| `-BcVersion` | `BC_VERSION` | `28.5` | Short (`28.5`, resolves to the newest build) or full build number. |
+| `-Country` | `BC_COUNTRY` | `w1` | Localization (`w1`, `us`, `de`, `dk`, `is`, …). |
+| `-BcType` | `BC_TYPE` | `sandbox` | `sandbox` or `onprem` artifacts. |
+| `-ArtifactUrl` | `BC_ARTIFACT_URL` | – | Explicit artifact URL; overrides version/country/type. |
+| `-Username` | `BC_SERVER_USERNAME` | `BCRUNNER` | BC login created with SUPER. |
+| `-Password` | `BC_SERVER_PASSWORD` | `Admin123!` | Its password. |
+| `-SaPassword` | `SA_PASSWORD` | `Passw0rd123!` | SQL Server `sa` password. |
+| `-WebClient` | `BC_WEBCLIENT` (`1`/`true`) | off | Self-host the BC web client. |
+| `-LicenseFile` (alias `-BcLicenseHostPath`) | `BC_LICENSE_HOST_PATH` or `LICENSE_FILE` | – | `.bclicense` imported **before** the service tier starts, instead of the CRONUS demo license. Required for ISV apps such as LS Central. |
+| `-Apps` | `APPS` (`;`-separated) | – | `.app` files and/or folders, published in the given order (see below). |
+| `-ContainerEnv` | any other key | – | Extra environment variables for the BC container (hashtable). In an env file, every unknown key is passed through, e.g. `BC_SERVER_SETTINGS=…`. |
+| `-PortOffset` | `PORT_OFFSET` | `0` | Added to every default port, so several environments can run side by side. |
+| `-DevPort` `-ODataPort` `-ApiPort` `-MgmtPort` `-ClientPort` `-WebClientPort` `-SqlPort` | `BC_DEV_PORT` … `SQL_PORT` | 7049 / 7048 / 7052 / 7045 / 7085 / 8080 / 11433 | Individual host ports (override the offset). |
+| `-Engine` | `ENGINE` | `auto` | `auto`, `docker` or `podman`. |
+| `-RepoPath` | `REPO_PATH` | `~/.bcvm/MsDyn365Bc.On.Linux` | Use your own clone of the upstream repo. |
+| `-RepoRef` | `REPO_REF` | `master` | Branch or tag to fetch when no `-RepoPath` is given. |
+| `-BcImage` | `BC_RUNNER_IMAGE` | upstream `bc-runner:latest` | Override the BC image. |
+| `-SqlImage` | `BC_SQL_IMAGE` | upstream default | Override the SQL Server image (e.g. one with Full-Text Search, see [docs/ROADMAP.md](docs/ROADMAP.md)). |
+| `-SqlMemoryMB` | `MSSQL_MEMORY_LIMIT_MB` | `3072` | SQL Server memory cap. |
+| `-PersistDatabase` | `PERSIST_DATABASE` | on | Keep the database in a volume. `-PersistDatabase:$false` uses upstream's in-memory tmpfs database, which is lost when the SQL container stops. |
+| `-TimeoutMinutes` | `TIMEOUT_MINUTES` | `45` | Maximum wait for the service tier. |
+| `-PublishTimeoutSeconds` | `PUBLISH_TIMEOUT_SECONDS` | `3600` | Maximum time for one extension publish. |
+| `-Recreate` | – | – | Remove an existing environment of the same name first (deletes its data). |
+| `-Remove` | – | – | Tear the environment down and exit. |
+
+### Example env file
+
+[`bc285-lscentral.env`](bc285-lscentral.env):
+
+```ini
+NAME=bc285
+BC_VERSION=28.5
+BC_COUNTRY=w1
+BC_TYPE=sandbox
+BC_WEBCLIENT=1
+BC_SERVER_USERNAME=BCRUNNER
+BC_SERVER_PASSWORD=Admin123!
+
+# Partner developer license, required for the LS Retail apps (relative to this file).
+BC_LICENSE_HOST_PATH=./BC28_1272026_6205373.bclicense
+
+# Published in this order.
+APPS=apps/LS Retail_LS Central System App_28.2.0.1847_runtime.app;apps/LS Retail_LS Central_28.2.0.1847.app;apps/LS Retail_LS Central for pharmacies_28.1.0.1199.app
+
+# Any other key goes straight to the BC container:
+# BC_SERVER_SETTINGS=DisableWriteInsideTryFunctions=false
+```
+
+### Running several environments
+
+Give each one its own name and port offset:
+
+```powershell
+./New-BcEnvironment.ps1 -Name bc285 -BcVersion 28.5
+./New-BcEnvironment.ps1 -Name bc290 -BcVersion 29.0 -PortOffset 100   # dev 7149, OData 7148, web 8180, SQL 11533 …
+```
+
+---
+
+## Extensions
+
+- Files are published through the dev endpoint (`/BC/dev/apps?SchemaUpdateMode=forcesync`)
+  **in the order given**, after the service tier is ready. Each one is installed as part of
+  the publish.
+- A folder in `-Apps` contributes its `*.app` files sorted by name.
+- If an app fails because one of its dependencies is not installed yet, it is **deferred**
+  and retried after the others. Any other failure stops the script and prints BC's error.
+- "Already published/installed" answers count as success, using the same rule as upstream
+  `scripts/publish-app.sh`, so re-running is safe.
+- Runtime packages (`*_runtime.app`) work like normal apps.
+- At the end, the script lists every non-Microsoft extension from the automation API and
+  warns about any that are published but not installed.
+
+Large apps take a while under emulation: LS Central 28.2 took 220–300 s on an M-series Mac.
+
+---
+
+## What the script does
+
+1. **Settings:** merges defaults, env file, `BCVM_*` variables and parameters.
+2. **Engine:** finds a running Docker or Podman. `docker` may be podman's alias; it is
+   detected through `docker --version`. Then it finds a compose command.
+3. **Checks:** the app and license files exist, all host ports are free, and no
+   environment of that name exists (unless `-Recreate`).
+4. **Upstream repo:** clones MsDyn365Bc.On.Linux into `~/.bcvm/MsDyn365Bc.On.Linux` on
+   first use, or downloads a zip if git is missing. Later runs fast-forward it (`git pull
+   --ff-only`), and an offline run keeps the cached copy.
+5. **Compose files:** writes two per-environment files in `~/.bcvm/<Name>/`:
+   - `compose.env`: all settings, using upstream's variable names, passed with `--env-file`
+   - `compose.override.yml`: what upstream does not offer as variables:
+     - `restart: unless-stopped`
+     - extra container environment
+     - a persistent `sql-data` volume, replacing upstream's tmpfs (SQL runs as root so
+       it can write to the fresh volume)
+     - a SQL image override, if `-SqlImage` is set
+
+   The stack is `docker-compose.yml` + (`docker-compose.macos.yml` when emulated) +
+   `compose.override.yml`. The file list is saved in `compose-files.txt` so `-Remove`
+   uses the same set.
+6. **Emulation (ARM hosts):** adds upstream's macOS overlay, which pins SQL Server 2022
+   CU17 because later CUs crash under Rosetta. It also sets
+   `DOTNET_INTERNAL_ThreadSuspendInjection=0` and `DOTNET_GCHeapCount=2` on the BC
+   container. Without them the service tier crashes under Rosetta with
+   `rosetta error: rt_tgsigqueueinfo failed in pend_signal` (exit 133). Both can be
+   overridden with `-ContainerEnv`.
+7. **Start:** `compose config` (validation), `compose pull --ignore-pull-failures`, then
+   `compose up -d`.
+8. **Wait:** polls until the container's `/tmp/bc-ready` marker exists **and** OData
+   `/Company` answers with the configured login. It prints upstream's boot progress lines
+   and fails fast, showing the last 60 log lines, if the container stops.
+9. **Extensions:** see above.
+10. **Summary:** endpoints, login, installed extensions, and the full compose command for
+    managing the stack.
+
+On first boot the container downloads the BC artifacts (about 2 GB), restores the demo
+database and starts the service tier. The upstream entrypoint also publishes the Microsoft
+test toolkit and its own *Test Runner Extension*, so those appear in the extension list.
+
+---
+
+## Managing an environment
+
+The summary prints the exact compose command. For `bc285` it is:
+
+```bash
+docker compose -p bc285 \
+  -f ~/.bcvm/MsDyn365Bc.On.Linux/docker-compose.yml \
+  -f ~/.bcvm/MsDyn365Bc.On.Linux/docker-compose.macos.yml \
+  -f ~/.bcvm/bc285/compose.override.yml \
+  --env-file ~/.bcvm/bc285/compose.env  <ps|logs -f bc|stop|start|restart bc>
+```
+
+- **Stop / start:** `stop` and `start` keep everything, including installed extensions and
+  data (verified: after a full stop/start the tier was back in about 100 s with all apps
+  installed). On a warm start the upstream entrypoint republishes its test toolkit, and BC
+  logs harmless "duplicate package ID" messages for it.
+- **Logs:** `docker logs -f bc285-bc-1`. The web client log is
+  `docker exec bc285-bc-1 tail -f /tmp/webclient.log`.
+- **Remove:** `./New-BcEnvironment.ps1 -Name bc285 -Remove` runs `compose down -v`, then
+  removes anything still labelled with the project and deletes `~/.bcvm/bc285`.
+- **Recreate:** add `-Recreate` to the create command.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `Pull failed, using the image already present locally … keychain cannot be accessed` | On macOS the Docker CLI's credential helper can't read the keychain from a non-interactive session. The images are public. The script carries on with cached images; to refresh, run `docker pull ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest` from an interactive terminal. |
+| `No running container engine found` | Start Docker Desktop, or run `podman machine start`. |
+| `Host port N is already in use` | Use `-PortOffset` or the individual port parameters. |
+| BC container exits with code 133 and `rosetta error` in the logs | Emulation without the .NET fixes. They are applied automatically on ARM; if you override `-ContainerEnv`, keep `DOTNET_INTERNAL_ThreadSuspendInjection=0`. |
+| LS (or other ISV) apps fail to publish with license / object-range errors | Pass the partner license with `-LicenseFile` / `BC_LICENSE_HOST_PATH`. |
+| `Text optimized index cannot be created … Full-Text Search component is not installed` | An app (or creating a new company) needs SQL Full-Text Search. Use an FTS-capable SQL image via `-SqlImage`; see [docs/ROADMAP.md](docs/ROADMAP.md) for the ARM build. |
+| Timeout waiting for BC | `docker logs <Name>-bc-1`. A first boot under emulation takes 3–5 min; slow artifact downloads add to that. |
+
+---
+
+## Validation
+
+Validated end to end on macOS (Apple Silicon, Docker Desktop 4.94, Compose v5.5.1):
+BC sandbox 28.5.54151.58046 W1, web client, partner license, LS Central System App
+28.2.0.1847 (runtime) → LS Central 28.2.0.1847 → LS Central for pharmacies 28.1.0.1199.
+Total 9 min:
+
+- 3 min to a ready service tier, including the artifact download
+- about 6 min to publish the three apps
+
+Persistence across stop/start was also verified.
+
+**Not yet tested:** Windows, Linux, Podman, and `-Remove` end to end. See [docs/ROADMAP.md](docs/ROADMAP.md).
+
+## Files
+
+| Path | Purpose |
+|---|---|
+| `New-BcEnvironment.ps1` | The script. `Get-Help ./New-BcEnvironment.ps1 -Detailed` for built-in help. |
+| `bc285-lscentral.env` | Example env file for the BC 28.5 + LS Central test bench. |
+| `docs/ROADMAP.md` | Findings, work in progress and backlog. |
+| `apps/` | *Local only, git-ignored.* Extensions for the test bench (`*.app`). |
+| `*.bclicense` | *Local only, git-ignored.* License files, e.g. the partner developer license. |
+| LS Retail packages | *Local only, git-ignored.* Configuration packages (`*.rapidstart`) and the LS Central / pharmacy release folders. |
+| `experiments/` | *Local only, git-ignored.* Prototypes for the configuration-package work, see [docs/ROADMAP.md](docs/ROADMAP.md). |
+| `~/.bcvm/` | Cached upstream repo and per-environment state (outside the project). |

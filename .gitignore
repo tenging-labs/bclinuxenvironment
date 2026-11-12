@@ -1,0 +1,32 @@
+# --- Local working material (not published) --------------------------------
+# Prototypes and scratch work for features in progress (see docs/ROADMAP.md).
+experiments/
+
+# Extensions used on the local test bench.
+apps/
+*.app
+
+# --- Licenses and secrets ---------------------------------------------------
+# BC license files (partner/developer licenses must never be published).
+*.bclicense
+*.flf
+# Personal env files with real credentials; keep shareable examples as *.env.
+*.local.env
+.env
+
+# --- Third-party content ----------------------------------------------------
+# LS Retail releases and demo data: configuration packages, retail images, etc.
+*.rapidstart
+ls-central-*-demo-data-package/
+LS Central for pharmacies */
+
+# --- OS / editor ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+
+# --- Claude Code personal settings (shared settings.json stays tracked) ------
+.claude/settings.local.json
