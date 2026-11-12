@@ -29,7 +29,7 @@
 
 .EXAMPLE
     ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -BcVersion 28.5 -Country w1 `
-        -LicenseFile ./dev.bclicense -Apps ./apps/a.app, ./apps/b.app
+        -LicenseFile ./dev.bclicense -Apps './apps/a.app;./apps/b.app'
 
 .EXAMPLE
     ./Invoke-BcLinuxEnvironment.ps1 -EnvFile ./bc285-lscentral.env
@@ -58,9 +58,10 @@ param(
     # Self-host the BC web client (http://localhost:<WebClientPort>). On by default; -WebClient:$false turns it off.
     [switch] $WebClient,
 
-    # .app files and/or folders, published in the given order. A folder contributes its
-    # *.app files sorted by name; apps whose dependencies are not there yet are retried
-    # after the others.
+    # .app files and/or folders, published in the given order. Preferred form: one string
+    # separated by ';' ('a.app;b.app'), the same in every shell and in env files; arrays and ','
+    # also work. A folder contributes its *.app files sorted by name; apps whose dependencies
+    # are not there yet are retried after the others.
     [string[]] $Apps,
     # Optional .bclicense file (e.g. a partner developer license) imported before the service
     # tier starts, instead of the CRONUS demo license. Needed for ISV apps such as LS Central.
@@ -282,7 +283,14 @@ function Resolve-HostPath([string] $Path) {
 }
 
 $appFiles = [Collections.Generic.List[string]]::new()
-foreach ($a in @($cfg.Apps)) {
+# `pwsh -File` (how bash/zsh/cmd run the script) passes `-Apps 'a.app','b.app'` as ONE string
+# "a.app,b.app". Split such an entry on ',' / ';' unless it exists as a path itself.
+$appEntries = foreach ($a in @($cfg.Apps)) {
+    if ($a -match '[,;]' -and -not (Test-Path -LiteralPath (Resolve-HostPath $a))) {
+        $a -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    } else { $a }
+}
+foreach ($a in $appEntries) {
     $full = Resolve-HostPath $a
     if (Test-Path -LiteralPath $full -PathType Container) {
         Get-ChildItem -LiteralPath $full -Filter *.app -File | Sort-Object Name | ForEach-Object { $appFiles.Add($_.FullName) }
