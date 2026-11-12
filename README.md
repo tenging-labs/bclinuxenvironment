@@ -52,6 +52,50 @@ When the script finishes, it prints the endpoints:
 
 ---
 
+## Run without cloning
+
+The script is a single self-contained file (it fetches the upstream compose files itself), so
+it can run straight from the private GitHub repo. In **PowerShell 7** (`pwsh`), authenticated
+with the GitHub CLI (`gh auth login`, account with access to `tenging-labs/LinuxBCContainer`):
+
+```powershell
+& ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/New-BcEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' }))) -Name bc285 -BcVersion 28.5 -Country w1 -WebClient `
+    -LicenseFile ./BC28_1272026_6205373.bclicense `
+    -Apps './apps/LS Retail_LS Central System App_28.2.0.1847_runtime.app',
+          './apps/LS Retail_LS Central_28.2.0.1847.app',
+          './apps/LS Retail_LS Central for pharmacies_28.1.0.1199.app'
+```
+
+Everything after the closing `)))` is exactly the same parameter list as for
+`./New-BcEnvironment.ps1`. Relative paths (license, apps, `-EnvFile`) resolve against your
+current directory.
+
+To get a reusable command instead, load it once per session (or put the first line in your
+`$PROFILE`). Then use `New-BcEnvironment` like the script, including tab completion:
+
+```powershell
+Set-Item function:global:New-BcEnvironment ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/New-BcEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' })))
+
+New-BcEnvironment -Name bc285 -BcVersion 28.5 -Country w1 -WebClient -LicenseFile ./dev.bclicense -Apps ./apps
+New-BcEnvironment -Name bc285 -Remove
+```
+
+Variations:
+
+- **Pin a version** for reproducible runs: append `?ref=v1.0.0` (a tag, branch or commit) to
+  the URL.
+- **Without the GitHub CLI:** use a fine-grained personal access token with *Contents: read*
+  on this repo. Replace `$(gh auth token)` with `$env:GITHUB_TOKEN` and set
+  `$env:GITHUB_TOKEN = '<token>'` first.
+- **From bash/zsh:** start `pwsh` first. Passing this through `pwsh -Command '…'` works but
+  needs extra quoting.
+
+Don't forward parameters through a wrapper like `function x { & $sb @args }`: `@args` breaks
+switches written as `-Switch:$false`. Defining the function with the script as its body, as
+above, binds every parameter natively.
+
+---
+
 ## Requirements
 
 | Requirement | Notes |

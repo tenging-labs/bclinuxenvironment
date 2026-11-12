@@ -193,15 +193,21 @@ $stateDir = Join-Path $stateRoot $n
 # ---------------------------------------------------------------------------
 # Container engine and compose command
 # ---------------------------------------------------------------------------
+# Shared state for the helper functions. No $script: variables: when the script runs as an
+# in-memory script block (README "Run without cloning"), $script: is the CALLER's scope, so
+# values set here would be invisible and leak into the user's session. Functions see $ctx
+# through normal scope lookup and update it in place (it is a reference type).
+$ctx = @{ EngineExe = $null; ComposeExe = $null; ComposePrefix = @(); ComposeFileArgs = @(); Project = $n }
+
 # Plain functions on purpose: everything after the name lands in $args unparsed,
 # so flags like -a / --format reach the engine instead of PowerShell's binder.
 function Invoke-Engine {
-    $out = & $script:engineExe @args 2>&1
+    $out = & $ctx.EngineExe @args 2>&1
     [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out | ForEach-Object { "$_" }) -join "`n" }
 }
 function Invoke-Compose {
-    $all = @($script:composePrefix) + @('-p', $script:n) + $script:composeFileArgs + @($args)
-    $out = & $script:composeExe @all 2>&1
+    $all = @($ctx.ComposePrefix) + @('-p', $ctx.Project) + @($ctx.ComposeFileArgs) + @($args)
+    $out = & $ctx.ComposeExe @all 2>&1
     [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out | ForEach-Object { "$_" }) -join "`n" }
 }
 function Assert-Ok($Result, [string] $What) {
@@ -213,13 +219,12 @@ $engineExe = $null
 $candidates = if ($cfg.Engine -eq 'auto') { @('docker', 'podman') } else { @($cfg.Engine) }
 foreach ($c in $candidates) {
     if (-not (Get-Command $c -CommandType Application -ErrorAction SilentlyContinue)) { continue }
-    $script:engineExe = $c
+    $ctx.EngineExe = $c
     if ((Invoke-Engine info).ExitCode -eq 0) { $engineExe = $c; break }
     Write-Note "$c is installed but its engine is not reachable (start Docker Desktop / 'podman machine start')."
-    $script:engineExe = $null
+    $ctx.EngineExe = $null
 }
 if (-not $engineExe) { throw "No running container engine found (tried: $($candidates -join ', '))." }
-$script:engineExe = $engineExe
 # `docker` may be podman's docker-compatible alias (podman-docker); --version tells them apart.
 $isPodman = (Invoke-Engine --version).Output -match 'podman'
 
@@ -235,7 +240,7 @@ if ((& $engineExe compose version 2>&1 | Out-String) -match 'version' -and $LAST
 } else {
     throw "No compose command found. Install Docker Compose v2 ('docker compose' / 'docker-compose'); with podman, 'podman compose' needs docker-compose as its provider."
 }
-$script:composeExe = $composeExe; $script:composePrefix = $composePrefix
+$ctx.ComposeExe = $composeExe; $ctx.ComposePrefix = $composePrefix
 
 $composeLabel = "label=com.docker.compose.project=$n"
 function Get-ServiceContainer([string] $Service) {
@@ -250,8 +255,8 @@ function Remove-BcEnvironment {
     Write-Step "Removing environment '$n' (compose down -v)"
     $filesList = Join-Path $stateDir 'compose-files.txt'
     if (Test-Path -LiteralPath $filesList) {
-        $script:composeFileArgs = @(Get-Content -LiteralPath $filesList | Where-Object { $_ } | ForEach-Object { '-f'; $_ }) +
-                                  @('--env-file', (Join-Path $stateDir 'compose.env'))
+        $ctx.ComposeFileArgs = @(Get-Content -LiteralPath $filesList | Where-Object { $_ } | ForEach-Object { '-f'; $_ }) +
+                               @('--env-file', (Join-Path $stateDir 'compose.env'))
         $r = Invoke-Compose down -v --remove-orphans
         if ($r.ExitCode -ne 0) { Write-Warning $r.Output }
     }
@@ -290,9 +295,16 @@ if ($cfg.LicenseFile) {
     if (-not (Test-Path -LiteralPath $licensePath -PathType Leaf)) { throw "License file not found: $($cfg.LicenseFile)" }
 }
 
-if ((Invoke-Engine ps -aq --filter $composeLabel).Output) {
+# Containers OR volumes count: after a plain `compose down` the volumes (database, installed
+# apps) are still there, and a new `up` would silently reuse them.
+$leftContainers = (Invoke-Engine ps -aq --filter $composeLabel).Output
+$leftVolumes = (Invoke-Engine volume ls -q --filter $composeLabel).Output
+if ($leftContainers -or $leftVolumes) {
     if ($Recreate) { Remove-BcEnvironment }
-    else { throw "Environment '$n' already exists. Use -Recreate to replace it, -Remove to delete it, or another -Name." }
+    else {
+        $what = if ($leftContainers) { 'containers' } else { "volumes only ($(($leftVolumes -split "`n") -join ', '))" }
+        throw "Environment '$n' already exists ($what). Use -Recreate to replace it, -Remove to delete it, or another -Name."
+    }
 }
 
 # Upstream always publishes the web client port, so check it too.
@@ -420,7 +432,7 @@ $macOverlay = Join-Path $repo 'docker-compose.macos.yml'
 if ($emulated -and (Test-Path -LiteralPath $macOverlay)) { $composeFiles += $macOverlay }
 $composeFiles += $overrideFile
 Set-Content -LiteralPath (Join-Path $stateDir 'compose-files.txt') -Value $composeFiles -Encoding utf8NoBOM
-$script:composeFileArgs = @($composeFiles | ForEach-Object { '-f'; $_ }) + @('--env-file', $composeEnvFile)
+$ctx.ComposeFileArgs = @($composeFiles | ForEach-Object { '-f'; $_ }) + @('--env-file', $composeEnvFile)
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $versionText = if ($cfg.ArtifactUrl) { $cfg.ArtifactUrl } else { "$($cfg.BcType) $($cfg.BcVersion) ($($cfg.Country))" }

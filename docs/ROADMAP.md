@@ -208,6 +208,10 @@ needed order.
 - **Stale `/tmp/bc-ready`:** after `compose restart` the marker is stale until the
   entrypoint clears it. The script's wait also requires OData, so it's not affected, but
   ad-hoc checks are.
+- **Wrong `-BcImage` builds from source:** upstream's compose has a `build:` section with
+  `pull_policy: missing`, so an image name that can't be pulled is silently built from upstream
+  `src/Dockerfile` (about 2 min) instead of failing. Consider checking that the image exists or
+  pulls before `compose up`.
 - **Image refresh:** consider pulling through the engine API when the CLI pull fails on a
   credential helper.
 - **Report upstream:** the Rosetta .NET crash and its fix; CU17-based FTS for Apple Silicon.
