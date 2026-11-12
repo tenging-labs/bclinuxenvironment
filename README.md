@@ -1,6 +1,6 @@
 # bcvm: Business Central environments in Docker or Podman
 
-`New-BcEnvironment.ps1` creates a Microsoft Dynamics 365 Business Central environment in a
+`Invoke-BcLinuxEnvironment.ps1` creates a Microsoft Dynamics 365 Business Central environment in a
 local container engine. It then installs your extensions (`.app` files) in the order you
 give them. One PowerShell script works the same way on Windows, Linux and macOS.
 
@@ -24,24 +24,24 @@ Work in progress (configuration packages and other open items) is tracked in
 
 ```powershell
 # BC 28.5 W1 with the web client and LS Central, as defined in an env file
-./New-BcEnvironment.ps1 -EnvFile ./bc285-lscentral.env
+./Invoke-BcLinuxEnvironment.ps1 -EnvFile ./bc285-lscentral.env
 
 # Same thing with parameters only
-./New-BcEnvironment.ps1 -Name bc285 -BcVersion 28.5 -Country w1 -WebClient `
+./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -BcVersion 28.5 -Country w1 `
     -LicenseFile ./BC28_1272026_6205373.bclicense `
     -Apps './apps/LS Retail_LS Central System App_28.2.0.1847_runtime.app',
           './apps/LS Retail_LS Central_28.2.0.1847.app',
           './apps/LS Retail_LS Central for pharmacies_28.1.0.1199.app'
 
 # Remove it again (containers, network, volumes, state)
-./New-BcEnvironment.ps1 -Name bc285 -Remove
+./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -Remove
 ```
 
 When the script finishes, it prints the endpoints:
 
 | What          | Default URL / value                       |
 |---------------|-------------------------------------------|
-| Web client    | http://localhost:8080/ (only with `-WebClient`) |
+| Web client    | http://localhost:8080/ (on by default; off with `-WebClient:$false`) |
 | Dev endpoint  | http://localhost:7049/BC/dev (publish apps, download symbols) |
 | OData v4      | http://localhost:7048/BC/ODataV4          |
 | API v2.0      | http://localhost:7052/BC/api/v2.0         |
@@ -59,7 +59,7 @@ it can run straight from the private GitHub repo. In **PowerShell 7** (`pwsh`), 
 with the GitHub CLI (`gh auth login`, account with access to `tenging-labs/LinuxBCContainer`):
 
 ```powershell
-& ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/New-BcEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' }))) -Name bc285 -BcVersion 28.5 -Country w1 -WebClient `
+& ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' }))) -Name bc285 -BcVersion 28.5 -Country w1 `
     -LicenseFile ./BC28_1272026_6205373.bclicense `
     -Apps './apps/LS Retail_LS Central System App_28.2.0.1847_runtime.app',
           './apps/LS Retail_LS Central_28.2.0.1847.app',
@@ -67,17 +67,17 @@ with the GitHub CLI (`gh auth login`, account with access to `tenging-labs/Linux
 ```
 
 Everything after the closing `)))` is exactly the same parameter list as for
-`./New-BcEnvironment.ps1`. Relative paths (license, apps, `-EnvFile`) resolve against your
+`./Invoke-BcLinuxEnvironment.ps1`. Relative paths (license, apps, `-EnvFile`) resolve against your
 current directory.
 
 To get a reusable command instead, load it once per session (or put the first line in your
-`$PROFILE`). Then use `New-BcEnvironment` like the script, including tab completion:
+`$PROFILE`). Then use `Invoke-BcLinuxEnvironment` like the script, including tab completion:
 
 ```powershell
-Set-Item function:global:New-BcEnvironment ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/New-BcEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' })))
+Set-Item function:global:Invoke-BcLinuxEnvironment ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' })))
 
-New-BcEnvironment -Name bc285 -BcVersion 28.5 -Country w1 -WebClient -LicenseFile ./dev.bclicense -Apps ./apps
-New-BcEnvironment -Name bc285 -Remove
+Invoke-BcLinuxEnvironment -Name bc285 -BcVersion 28.5 -Country w1 -LicenseFile ./dev.bclicense -Apps ./apps
+Invoke-BcLinuxEnvironment -Name bc285 -Remove
 ```
 
 Variations:
@@ -143,7 +143,7 @@ Relative paths in an env file (apps, license) are resolved against the env file'
 | `-Username` | `BC_SERVER_USERNAME` | `BCRUNNER` | BC login created with SUPER. |
 | `-Password` | `BC_SERVER_PASSWORD` | `Admin123!` | Its password. |
 | `-SaPassword` | `SA_PASSWORD` | `Passw0rd123!` | SQL Server `sa` password. |
-| `-WebClient` | `BC_WEBCLIENT` (`1`/`true`) | off | Self-host the BC web client. |
+| `-WebClient` | `BC_WEBCLIENT` (`1`/`0`) | **on** | Self-host the BC web client. Turn it off with `-WebClient:$false` or `BC_WEBCLIENT=0`. |
 | `-LicenseFile` (alias `-BcLicenseHostPath`) | `BC_LICENSE_HOST_PATH` or `LICENSE_FILE` | – | `.bclicense` imported **before** the service tier starts, instead of the CRONUS demo license. Required for ISV apps such as LS Central. |
 | `-Apps` | `APPS` (`;`-separated) | – | `.app` files and/or folders, published in the given order (see below). |
 | `-ContainerEnv` | any other key | – | Extra environment variables for the BC container (hashtable). In an env file, every unknown key is passed through, e.g. `BC_SERVER_SETTINGS=…`. |
@@ -170,7 +170,6 @@ NAME=bc285
 BC_VERSION=28.5
 BC_COUNTRY=w1
 BC_TYPE=sandbox
-BC_WEBCLIENT=1
 BC_SERVER_USERNAME=BCRUNNER
 BC_SERVER_PASSWORD=Admin123!
 
@@ -189,8 +188,8 @@ APPS=apps/LS Retail_LS Central System App_28.2.0.1847_runtime.app;apps/LS Retail
 Give each one its own name and port offset:
 
 ```powershell
-./New-BcEnvironment.ps1 -Name bc285 -BcVersion 28.5
-./New-BcEnvironment.ps1 -Name bc290 -BcVersion 29.0 -PortOffset 100   # dev 7149, OData 7148, web 8180, SQL 11533 …
+./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -BcVersion 28.5
+./Invoke-BcLinuxEnvironment.ps1 -Name bc290 -BcVersion 29.0 -PortOffset 100   # dev 7149, OData 7148, web 8180, SQL 11533 …
 ```
 
 ---
@@ -274,7 +273,7 @@ docker compose -p bc285 \
   logs harmless "duplicate package ID" messages for it.
 - **Logs:** `docker logs -f bc285-bc-1`. The web client log is
   `docker exec bc285-bc-1 tail -f /tmp/webclient.log`.
-- **Remove:** `./New-BcEnvironment.ps1 -Name bc285 -Remove` runs `compose down -v`, then
+- **Remove:** `./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -Remove` runs `compose down -v`, then
   removes anything still labelled with the project and deletes `~/.bcvm/bc285`.
 - **Recreate:** add `-Recreate` to the create command.
 
@@ -312,7 +311,7 @@ Persistence across stop/start was also verified.
 
 | Path | Purpose |
 |---|---|
-| `New-BcEnvironment.ps1` | The script. `Get-Help ./New-BcEnvironment.ps1 -Detailed` for built-in help. |
+| `Invoke-BcLinuxEnvironment.ps1` | The script. `Get-Help ./Invoke-BcLinuxEnvironment.ps1 -Detailed` for built-in help. |
 | `bc285-lscentral.env` | Example env file for the BC 28.5 + LS Central test bench. |
 | `docs/ROADMAP.md` | Findings, work in progress and backlog. |
 | `apps/` | *Local only, git-ignored.* Extensions for the test bench (`*.app`). |

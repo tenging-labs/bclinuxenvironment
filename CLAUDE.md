@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single cross-platform PowerShell 7.2+ script, `New-BcEnvironment.ps1`, that creates a Business Central
+A single cross-platform PowerShell 7.2+ script, `Invoke-BcLinuxEnvironment.ps1`, that creates a Business Central
 environment with Docker or Podman Compose on Windows, Linux and macOS. It then publishes `.app`
 extensions in a given order. It wraps upstream
 [MsDyn365Bc.On.Linux](https://github.com/aldevtools/MsDyn365Bc.On.Linux) (BC service tier patched to run
@@ -19,13 +19,13 @@ There is no build, linter or unit-test suite. Validation is a parse check plus a
 
 ```bash
 # Parse check (run after every edit)
-pwsh -NoProfile -Command '$e=$null;$null=[System.Management.Automation.Language.Parser]::ParseFile("$PWD/New-BcEnvironment.ps1",[ref]$null,[ref]$e); if($e){$e}else{"parse OK"}'
+pwsh -NoProfile -Command '$e=$null;$null=[System.Management.Automation.Language.Parser]::ParseFile("$PWD/Invoke-BcLinuxEnvironment.ps1",[ref]$null,[ref]$e); if($e){$e}else{"parse OK"}'
 
 # End-to-end run on the test bench (≈9 min: ~3 min boot, ~6 min LS apps). Run it in the background.
-pwsh -NoProfile -File ./New-BcEnvironment.ps1 -EnvFile ./bc285-lscentral.env [-Recreate]
+pwsh -NoProfile -File ./Invoke-BcLinuxEnvironment.ps1 -EnvFile ./bc285-lscentral.env [-Recreate]
 
 # Tear down (compose down -v + label-based cleanup + ~/.bcvm/<Name>)
-pwsh -NoProfile -File ./New-BcEnvironment.ps1 -Name bc285 -Remove
+pwsh -NoProfile -File ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -Remove
 
 # Manage a running environment directly (the script prints this command; macOS overlay only on ARM)
 docker compose -p bc285 -f ~/.bcvm/MsDyn365Bc.On.Linux/docker-compose.yml \
@@ -54,7 +54,7 @@ Relative paths resolve against `$PWD` (or the env file's folder), never the scri
   Shared state for helper functions lives in the `$ctx` hashtable; functions read it through
   normal scope lookup and mutate it in place.
 - **Test both modes.** Run the script as a file, and as
-  `& ([scriptblock]::Create((Get-Content -Raw ./New-BcEnvironment.ps1))) <params>`. The run must
+  `& ([scriptblock]::Create((Get-Content -Raw ./Invoke-BcLinuxEnvironment.ps1))) <params>`. The run must
   get past `compose config/pull/up` (and `-Remove` on a real environment) to cover the helper
   functions. Stopping at validation proves only parameter binding.
 
