@@ -105,6 +105,10 @@ Cross-cutting rules:
   The marker survives a container restart until the entrypoint clears it, so never trust it alone.
 - **Extension publish:**
   - Endpoint: dev endpoint `.../BC/dev/apps?SchemaUpdateMode=forcesync`, in the given order.
+  - **Posted from inside the bc container**, never from the host: `docker cp` the app and a small
+    `publish.sh` to `/tmp/bcvm-publish`, `docker exec -d` it (curl to `localhost:7049`, auth via
+    `BCVM_AUTH` env), poll `<app>.code`. Kiri's port forwarding cuts connections idle for 300 s,
+    and BC then cancels and rolls back the publish (LS Central takes longer than that).
   - Success: HTTP 200, or a benign 422, using the same regex as upstream `publish-app.sh`.
   - Dependency-looking failures are deferred and retried in another pass; anything else throws.
 - **Version `latest`** (default) is resolved by the script from the public artifact index

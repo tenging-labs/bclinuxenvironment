@@ -544,26 +544,54 @@ Write-Step "Service tier ready after $([int]$sw.Elapsed.TotalMinutes) min. Compa
 # ---------------------------------------------------------------------------
 # Extensions
 # ---------------------------------------------------------------------------
+# Publishing runs INSIDE the bc container (curl to its own localhost:7049, like upstream's
+# scripts/publish-app.sh), started detached and polled through a result file. No host connection
+# stays open for the whole publish: Kiri's port forwarding drops connections that carry no data
+# for 300 s, and a large app (e.g. LS Central) publishes longer than that, so a host-side POST was
+# cut off and BC rolled the publish back.
+$publishDir = '/tmp/bcvm-publish'
+$publishScript = @'
+#!/bin/sh
+# $1: .app path in this container, $2: curl --max-time. Writes $1.code (HTTP code, 000 = no answer).
+code=$(curl -s -o "$1.body" -w '%{http_code}' --max-time "$2" -u "$BCVM_AUTH" -X POST \
+  -F "file=@$1;type=application/octet-stream" \
+  'http://localhost:7049/BC/dev/apps?SchemaUpdateMode=forcesync')
+echo "$code" > "$1.code.tmp" && mv "$1.code.tmp" "$1.code"
+'@
 function Publish-BcApp([string] $Path) {
-    $url = "http://localhost:$($ports.DevPort)/BC/dev/apps?SchemaUpdateMode=forcesync"
     $t = [Diagnostics.Stopwatch]::StartNew()
-    try {
-        $r = Invoke-WebRequest -Uri $url -Method Post -Headers $authHeader -TimeoutSec $cfg.PublishTimeoutSeconds `
-            -Form @{ file = Get-Item -LiteralPath $Path } -SkipHttpErrorCheck
-    } catch {
-        return [pscustomobject]@{ Ok = $false; Retry = $false; Seconds = [int]$t.Elapsed.TotalSeconds; Message = $_.Exception.Message }
+    $fail = { param($m) [pscustomobject]@{ Ok = $false; Retry = $false; Seconds = [int]$t.Elapsed.TotalSeconds; Message = $m } }
+    $remote = "$publishDir/$([guid]::NewGuid().ToString('N')).app"
+    $r = Invoke-Engine cp $Path "$($bcContainer):$remote"
+    if ($r.ExitCode -ne 0) { return & $fail "copying the app into $bcContainer failed: $($r.Output)" }
+    $r = Invoke-Engine exec -d -e "BCVM_AUTH=$pair" $bcContainer sh "$publishDir/publish.sh" $remote $cfg.PublishTimeoutSeconds
+    if ($r.ExitCode -ne 0) { return & $fail "starting the publish in $bcContainer failed: $($r.Output)" }
+    while ($true) {
+        Start-Sleep -Seconds 3
+        $c = Invoke-Engine exec $bcContainer cat "$remote.code"
+        if ($c.ExitCode -eq 0 -and $c.Output.Trim()) { break }
+        if ($t.Elapsed.TotalSeconds -gt $cfg.PublishTimeoutSeconds + 60) { return & $fail "no result after $($cfg.PublishTimeoutSeconds)s (-PublishTimeoutSeconds)." }
     }
-    $body = "$($r.Content)"
+    $code = [int]$c.Output.Trim()
+    $body = (Invoke-Engine exec $bcContainer cat "$remote.body").Output
+    $null = Invoke-Engine exec $bcContainer rm -f $remote "$remote.body" "$remote.code"
     # Same benign-422 rule as upstream scripts/publish-app.sh.
-    $ok = $r.StatusCode -eq 200 -or ($r.StatusCode -eq 422 -and $body -match 'already (deployed|installed|published|exists)|duplicate package' -and
+    $ok = $code -eq 200 -or ($code -eq 422 -and $body -match 'already (deployed|installed|published|exists)|duplicate package' -and
           $body -notmatch 'publishing failed|could not install the extension|original extensions have been restored')
     $missingDep = $body -match 'dependenc|could not be found|AL1024|symbols'
-    [pscustomobject]@{ Ok = $ok; Retry = (-not $ok -and $missingDep); Seconds = [int]$t.Elapsed.TotalSeconds; Message = "HTTP $($r.StatusCode) $body".Trim() }
+    $msg = if ($code -eq 0) { "no HTTP answer from the dev endpoint (curl timeout or connection error). $body" } else { "HTTP $code $body" }
+    [pscustomobject]@{ Ok = $ok; Retry = (-not $ok -and $missingDep); Seconds = [int]$t.Elapsed.TotalSeconds; Message = $msg.Trim() }
 }
 
 $installed = [Collections.Generic.List[string]]::new()
 if ($appFiles.Count) {
     Write-Step "Publishing $($appFiles.Count) extension(s)"
+    $helper = Join-Path ([IO.Path]::GetTempPath()) "bcvm-publish-$([guid]::NewGuid().ToString('N')).sh"
+    Set-Content -LiteralPath $helper -Value ($publishScript -replace "`r`n", "`n") -NoNewline -Encoding utf8NoBOM
+    try {
+        $null = Assert-Ok (Invoke-Engine exec $bcContainer mkdir -p $publishDir) 'creating the publish folder in the bc container'
+        $null = Assert-Ok (Invoke-Engine cp $helper "$($bcContainer):$publishDir/publish.sh") 'copying the publish helper into the bc container'
+    } finally { Remove-Item -LiteralPath $helper -ErrorAction SilentlyContinue }
     $pending = [Collections.Generic.List[string]]::new($appFiles)
     while ($pending.Count) {
         $deferred = [Collections.Generic.List[string]]::new()

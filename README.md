@@ -316,6 +316,10 @@ Give each one its own name and port offset:
 - Files are published through the dev endpoint (`/BC/dev/apps?SchemaUpdateMode=forcesync`)
   **in the order given**, after the service tier is ready. Each one is installed as part of
   the publish.
+- The upload runs **inside the BC container** (copied in with `docker cp`, posted with curl to
+  the container's own `localhost:7049`, like upstream's `publish-app.sh`), and the script polls
+  for the result. A publish can take minutes, and some engines' port forwarding drops a
+  connection that stays silent that long (Kiri: 300 s), which made BC roll the publish back.
 - Give the list as **one string separated by `;`**: `-Apps 'a.app;b.app'`, the same as `APPS=`
   in an env file. It works identically from every shell. A PowerShell array
   (`-Apps 'a.app','b.app'`) and `,` as the separator are accepted too. An entry that exists as

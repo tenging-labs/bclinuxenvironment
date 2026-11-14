@@ -32,6 +32,11 @@ Status as of 2026-11-14. Usage of what works today is in [README.md](../README.m
    uninstalled Docker Desktop (dangling `/usr/local/bin/docker`, stale `desktop-linux`
    context) made the script pick a dead CLI/engine; detection now skips dangling links and
    reports the context.
+8. **Kiri's port forwarding drops connections idle for 300 s.** Measured: a host server
+   answering after 330 s works; the same through a Kiri published port fails at 301 s. A
+   host-side publish POST of LS Central (> 300 s) was cut, BC logged `TaskCanceledException` and
+   restored the previous extensions. Publishing now runs inside the bc container (detached
+   curl to `localhost:7049`, result file polled), so no long host connection exists.
 5. **`podman compose` lacks `--wait`.** That is why the script does its own readiness
    polling instead.
 6. **Database lost on restart upstream.** Upstream keeps the database on tmpfs. The
