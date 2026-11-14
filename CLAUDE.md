@@ -107,6 +107,9 @@ Cross-cutting rules:
   - Endpoint: dev endpoint `.../BC/dev/apps?SchemaUpdateMode=forcesync`, in the given order.
   - Success: HTTP 200, or a benign 422, using the same regex as upstream `publish-app.sh`.
   - Dependency-looking failures are deferred and retried in another pass; anything else throws.
+- **Version `latest`** (default) is resolved by the script from the public artifact index
+  (`bcartifacts-…azurefd.net/<type>/indexes/<country>.json`, newest `Version`), because upstream only
+  resolves prefixes. The full build goes into `compose.env`.
 - **Persistence:** SQL data lives in the `sql-data` volume (SQL runs as `0:0`). The upstream
   entrypoint reuses an existing `CRONUS` DB, so stop/start keeps installed apps.
 

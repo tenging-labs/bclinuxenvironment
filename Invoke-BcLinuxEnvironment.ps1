@@ -28,6 +28,9 @@
     State (generated compose override and env file) is kept in ~/.bcvm/<Name>.
 
 .EXAMPLE
+    ./Invoke-BcLinuxEnvironment.ps1      # latest public BC release, W1 sandbox, web client, name 'bc'
+
+.EXAMPLE
     ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -BcVersion 28.5 -Country w1 `
         -LicenseFile ./dev.bclicense -Apps './apps/a.app;./apps/b.app'
 
@@ -42,7 +45,8 @@
 param(
     # Environment name = compose project name (containers <Name>-bc-1, <Name>-sql-1).
     [string] $Name,
-    # BC version: short ("28.5") resolves to the newest build, or a full build number.
+    # BC version: 'latest' (default) = newest public release of BcType/Country; short ("28.5")
+    # = newest build of that minor; or a full build number.
     [string] $BcVersion,
     # Localization, e.g. w1, us, de, dk, is.
     [string] $Country,
@@ -110,7 +114,7 @@ function Write-Note([string] $Message) { Write-Host "           $Message" -Foreg
 # ---------------------------------------------------------------------------
 $defaults = [ordered]@{
     Name                  = 'bc'
-    BcVersion             = '28.5'
+    BcVersion             = 'latest'
     Country               = 'w1'
     BcType                = 'sandbox'
     ArtifactUrl           = ''
@@ -321,6 +325,23 @@ foreach ($p in $ports.Values) {
     try { $l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, $p); $l.Start() }
     catch { throw "Host port $p is already in use. Use -PortOffset or the individual -*Port parameters." }
     finally { if ($l) { $l.Stop() } }
+}
+
+# 'latest' is resolved here, from the same public artifact index upstream uses for short
+# versions (upstream itself only understands prefixes). Released builds only, no insider.
+# The full build number goes into compose.env, so later stop/start keeps that exact build.
+if (-not $cfg.ArtifactUrl -and (-not $cfg.BcVersion -or $cfg.BcVersion -eq 'latest')) {
+    $indexUrl = "https://bcartifacts-exdbf9fwegejdqak.b02.azurefd.net/$($cfg.BcType)/indexes/$($cfg.Country.ToLowerInvariant()).json"
+    $index = $null
+    foreach ($attempt in 1..3) {
+        try { $index = Invoke-RestMethod -Uri $indexUrl -TimeoutSec 60; break }
+        catch { if ($attempt -eq 3) { throw "Could not resolve the latest BC version from $indexUrl ($($_.Exception.Message)). Pass -BcVersion explicitly, e.g. -BcVersion 28.5." }; Start-Sleep -Seconds 3 }
+    }
+    $latest = @($index) | Where-Object { $_.Version -match '^\d+(\.\d+){3}$' } |
+        Sort-Object { [version] $_.Version } | Select-Object -Last 1
+    if (-not $latest) { throw "No BC $($cfg.BcType) versions found for country '$($cfg.Country)' at $indexUrl." }
+    $cfg.BcVersion = $latest.Version
+    Write-Step "Latest public BC $($cfg.BcType) release for $($cfg.Country): $($cfg.BcVersion)"
 }
 
 # The bc-runner image is linux/amd64 only. On ARM hosts (Apple Silicon, ARM Linux/Windows)

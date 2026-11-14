@@ -22,8 +22,24 @@ Work in progress (configuration packages and other open items) is tracked in
 
 ## Quick start
 
+No parameters are needed. This starts the **latest public BC release** as a W1 sandbox, with the
+web client, in an environment named `bc`:
+
 ```powershell
-# BC 28.5 W1 with the web client, as defined in an env file
+./Invoke-BcLinuxEnvironment.ps1
+```
+
+Or straight from GitHub, without cloning (PowerShell 7; other shells in
+[Run without cloning](#run-without-cloning)):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1)))
+```
+
+More options:
+
+```powershell
+# Settings from an env file
 ./Invoke-BcLinuxEnvironment.ps1 -EnvFile ./example.env
 
 # With a partner license and your apps (one string, ';'-separated, installed in that order)
@@ -31,8 +47,8 @@ Work in progress (configuration packages and other open items) is tracked in
     -LicenseFile ./dev.bclicense `
     -Apps './apps/Dependency.app;./apps/MyApp.app'
 
-# Remove it again (containers, network, volumes, state)
-./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -Remove
+# Remove an environment again (containers, network, volumes, state); the default one is 'bc'
+./Invoke-BcLinuxEnvironment.ps1 -Name bc -Remove
 ```
 
 When the script finishes, it prints the endpoints:
@@ -76,12 +92,15 @@ directory**. The parameters are the same as for `./Invoke-BcLinuxEnvironment.ps1
 Everything after the closing `)))` is the normal parameter list:
 
 ```powershell
+# Latest public BC release, W1 sandbox, web client (environment 'bc')
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1)))
+
 # BC 28.5 W1 + partner license + your apps, installed in this order
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name bc285 -BcVersion 28.5 -Country w1 `
     -LicenseFile ./dev.bclicense `
     -Apps './apps/Dependency.app;./apps/MyApp.app'
 
-# A plain BC 29.0 next to it (every port +100: web 8180, dev 7149, OData 7148, SQL 11533, ...)
+# A specific BC version next to it (every port +100: web 8180, dev 7149, OData 7148, SQL 11533, ...)
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name bc290 -BcVersion 29.0 -PortOffset 100
 
 # Everything from an env file, on a third set of ports (+200)
@@ -91,7 +110,7 @@ Everything after the closing `)))` is the normal parameter list:
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name bc285de -BcVersion 28.5 -Country de -Apps ./apps -LicenseFile ./dev.bclicense -WebClient:$false
 
 # Throw-away environment: in-memory database, replaces an existing one of the same name
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name scratch -BcVersion 28.5 -PersistDatabase:$false -Recreate
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name scratch -PersistDatabase:$false -Recreate
 
 # Remove an environment (containers, volumes, ~/.bcvm/<Name>)
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name bc290 -Remove
@@ -113,10 +132,11 @@ every parameter natively.
 
 ### zsh / bash (macOS, Linux, WSL)
 
-Download to a temp file and run it with `pwsh -File`. As a one-liner:
+Download to a temp file and run it with `pwsh -File`. As a one-liner (latest public release,
+W1 sandbox; append parameters as needed):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1 -o "${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1" && pwsh -NoProfile -File "${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1" -Name bc290 -BcVersion 29.0 -PortOffset 100
+curl -fsSL https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1 -o "${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1" && pwsh -NoProfile -File "${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1"
 ```
 
 For regular use, add a function to `~/.zshrc` or `~/.bashrc`. It fetches the latest script on
@@ -131,6 +151,8 @@ bclinux() {
 ```
 
 ```bash
+bclinux                       # latest public release, W1 sandbox, web client
+
 bclinux -Name bc285 -BcVersion 28.5 -Country w1 \
   -LicenseFile ./dev.bclicense \
   -Apps './apps/Dependency.app;./apps/MyApp.app'
@@ -165,7 +187,7 @@ Usage and quoting are the same as for bash. Not tested yet.
 `curl.exe` ships with Windows 10 and later:
 
 ```bat
-curl -fsSL https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1 -o "%TEMP%\Invoke-BcLinuxEnvironment.ps1" && pwsh -NoProfile -File "%TEMP%\Invoke-BcLinuxEnvironment.ps1" -Name bc290 -BcVersion 29.0 -PortOffset 100
+curl -fsSL https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1 -o "%TEMP%\Invoke-BcLinuxEnvironment.ps1" && pwsh -NoProfile -File "%TEMP%\Invoke-BcLinuxEnvironment.ps1"
 ```
 
 Use double quotes for values with spaces (`-Apps "a.app;b.app"`). `-WebClient:$false` needs no
@@ -230,7 +252,7 @@ Relative paths in an env file (apps, license) are resolved against the env file'
 | Parameter | Env file key | Default | Description |
 |---|---|---|---|
 | `-Name` | `NAME` | `bc` | Environment name = compose project name. Lowercase letters, digits, `_`, `-`. Containers are `<Name>-bc-1` and `<Name>-sql-1`. |
-| `-BcVersion` | `BC_VERSION` | `28.5` | Short (`28.5`, resolves to the newest build) or full build number. |
+| `-BcVersion` | `BC_VERSION` | `latest` | `latest`: the newest public release for `-BcType`/`-Country`, read from Microsoft's artifact index when the environment is created (insider builds are never picked). Short (`28.5`): the newest build of that version. Or a full build number. The resolved build is stored, so stop/start keeps it. |
 | `-Country` | `BC_COUNTRY` | `w1` | Localization (`w1`, `us`, `de`, `dk`, `is`, …). |
 | `-BcType` | `BC_TYPE` | `sandbox` | `sandbox` or `onprem` artifacts. |
 | `-ArtifactUrl` | `BC_ARTIFACT_URL` | – | Explicit artifact URL; overrides version/country/type. |
@@ -262,6 +284,7 @@ git-ignored, so personal copies (with license paths and app lists) stay out of t
 
 ```ini
 NAME=bc285
+# 'latest' (default) = newest public release; or e.g. 28.5, or a full build number.
 BC_VERSION=28.5
 BC_COUNTRY=w1
 BC_TYPE=sandbox
@@ -316,6 +339,8 @@ Large apps take a while under emulation: a large ISV app (LS Central 28.2) took 
    detected through `docker --version`. Then it finds a compose command.
 3. **Checks:** the app and license files exist, all host ports are free, and no
    environment of that name exists (unless `-Recreate`).
+   With `-BcVersion latest` (the default) it then reads Microsoft's public artifact index
+   for the sandbox/onprem type and country, and uses the newest released build number.
 4. **Upstream repo:** clones MsDyn365Bc.On.Linux into `~/.bcvm/MsDyn365Bc.On.Linux` on
    first use, or downloads a zip if git is missing. Later runs fast-forward it (`git pull
    --ff-only`), and an offline run keeps the cached copy.
