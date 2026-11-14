@@ -264,6 +264,7 @@ Relative paths in an env file (apps, license) are resolved against the env file'
 | `-LicenseFile` (alias `-BcLicenseHostPath`) | `BC_LICENSE_HOST_PATH` or `LICENSE_FILE` | – | `.bclicense` imported **before** the service tier starts, instead of the CRONUS demo license. Required for ISV apps such as LS Central. |
 | `-Apps` | `APPS` | – | `.app` files and/or folders, published in the given order: one string separated by `;` (`'a.app;b.app'`), or a PowerShell array. See below. |
 | `-ContainerEnv` | any other key | – | Extra environment variables for the BC container (hashtable). In an env file, every unknown key is passed through, e.g. `BC_SERVER_SETTINGS=…`. |
+| `-PublishPorts` | `PUBLISH_PORTS` (`1`/`0`) | **on** | Publish the BC and SQL ports on `localhost`. `-PublishPorts:$false` publishes none (no port planning); a port set explicitly, e.g. `-SqlPort 11433`, is still published. On Kiri the endpoints are reachable by name, see [Container names (Kiri)](#container-names-kiri). |
 | `-PortOffset` | `PORT_OFFSET` | `0` | Added to every default port, so several environments can run side by side. |
 | `-DevPort` `-ODataPort` `-ApiPort` `-MgmtPort` `-ClientPort` `-WebClientPort` `-SqlPort` | `BC_DEV_PORT` … `SQL_PORT` | 7049 / 7048 / 7052 / 7045 / 7085 / 8080 / 11433 | Individual host ports (override the offset). |
 | `-Engine` | `ENGINE` | `auto` | `auto` (`docker` if its CLI exists, else `podman`), `docker` or `podman`. `docker` follows its current context (`DOCKER_CONTEXT` / `docker context use`), so Kiri, OrbStack etc. need no option. |
@@ -308,6 +309,41 @@ Give each one its own name and port offset:
 ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -BcVersion 28.5
 ./Invoke-BcLinuxEnvironment.ps1 -Name bc290 -BcVersion 29.0 -PortOffset 100   # dev 7149, OData 7148, web 8180, SQL 11533 …
 ```
+
+On Kiri, skip the ports altogether and use names instead (next section):
+
+```powershell
+./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -BcVersion 28.5 -PublishPorts:$false
+./Invoke-BcLinuxEnvironment.ps1 -Name bc290 -BcVersion 29.0 -PublishPorts:$false
+```
+
+### Container names (Kiri)
+
+[Kiri](https://runkiri.com/) gives every container an HTTP name on port 80:
+`http://<service>.<project>.kiri.local` (or `.kiri.localhost` when local names are not turned on with
+`kiri setup --domains`). A name reaches **one** port of its container, and BC has several, so on Kiri
+the script adds a small `router` container (nginx) to the environment. The router answers one name per
+endpoint and forwards inside the compose network:
+
+| Endpoint | Name (environment `bc285`) |
+|---|---|
+| Web client | `http://bc.bc285.kiri.local/` (the bc container itself, port 8080) |
+| Dev endpoint (AL publish, symbols) | `http://dev.bc285.kiri.local/BC/dev` |
+| OData v4 | `http://odata.bc285.kiri.local/BC/ODataV4` |
+| API v2.0 | `http://api.bc285.kiri.local/BC/api/v2.0` |
+| Client services (WebSocket) | `ws://client.bc285.kiri.local/BC` |
+| SQL Server | no name: names are HTTP only. Publish it with `-SqlPort <port>`. |
+
+The names work whether or not ports are published. With `-PublishPorts:$false`, nothing is published on
+`localhost`, so environments never collide on ports and need no `-PortOffset`. The summary at the end
+prints the names, and the AL `launch.json` values for the dev endpoint:
+
+```json
+"server": "http://dev.bc285.kiri.local", "port": 80, "serverInstance": "BC", "authentication": "UserPassword"
+```
+
+On other engines `-PublishPorts:$false` works too, but then BC is reachable only from inside the
+compose network.
 
 ---
 

@@ -80,6 +80,12 @@ Cross-cutting rules:
   - Unknown env-file keys and `-ContainerEnv` are passed straight to the BC container.
   - Adding a setting means touching: `param()`, `$defaults`, `$keyMap`, `ConvertTo-Setting` (if
     typed), the compose env/override generation, and the README table.
+- **Ports and names:** `-PublishPorts:$false` overrides upstream's `ports:` with `!override [...]`
+  (only explicitly given ports). On Kiri (`docker info` OperatingSystem `Kiri`) the override adds a
+  `router` service (nginx, generated `~/.bcvm/<Name>/router.conf`, label `dev.kiri.domain`) for
+  `dev./odata./api./client.<Name>.kiri.local`; `bc.<Name>.kiri.local` is the bc container (label
+  `dev.kiri.http.port: 8080`). Kiri names are HTTP on port 80 only, one container port per name.
+  Readiness and extension checks query BC with curl **inside** the bc container, never via host ports.
 - **Compose layering:**
   - Files: upstream `docker-compose.yml`, plus `docker-compose.macos.yml` when emulated, plus the
     generated `~/.bcvm/<Name>/compose.override.yml`.

@@ -35,6 +35,9 @@
         -LicenseFile ./dev.bclicense -Apps './apps/a.app;./apps/b.app'
 
 .EXAMPLE
+    ./Invoke-BcLinuxEnvironment.ps1 -Name bc290 -PublishPorts:$false   # Kiri: http://dev.bc290.kiri.local, ... no ports
+
+.EXAMPLE
     ./Invoke-BcLinuxEnvironment.ps1 -EnvFile ./example.env
 
 .EXAMPLE
@@ -79,6 +82,10 @@ param(
     [int] $PortOffset,
     [int] $DevPort, [int] $ODataPort, [int] $ApiPort, [int] $MgmtPort, [int] $ClientPort,
     [int] $WebClientPort, [int] $SqlPort,
+    # Publish the BC/SQL ports on localhost (default). -PublishPorts:$false publishes none, so no
+    # port planning is needed; endpoints are then reached by name (Kiri: http://dev.<Name>.kiri.local
+    # ...). A port given explicitly (e.g. -SqlPort 11433) is still published.
+    [switch] $PublishPorts,
 
     [ValidateSet('auto', 'docker', 'podman')] [string] $Engine,
     # Existing clone of MsDyn365Bc.On.Linux. Default: cached clone in ~/.bcvm/MsDyn365Bc.On.Linux.
@@ -125,6 +132,7 @@ $defaults = [ordered]@{
     Apps                  = @()
     LicenseFile           = ''
     PortOffset            = 0
+    PublishPorts          = $true
     Engine                = 'auto'
     RepoPath              = ''
     RepoRef               = 'master'
@@ -141,7 +149,7 @@ $keyMap = @{
     BC_ARTIFACT_URL = 'ArtifactUrl'; BC_SERVER_USERNAME = 'Username'; BC_SERVER_PASSWORD = 'Password'
     SA_PASSWORD = 'SaPassword'; BC_WEBCLIENT = 'WebClient'; APPS = 'Apps'
     LICENSE_FILE = 'LicenseFile'; BC_LICENSE_HOST_PATH = 'LicenseFile'
-    PORT_OFFSET = 'PortOffset'; BC_DEV_PORT = 'DevPort'; BC_ODATA_PORT = 'ODataPort'; BC_API_PORT = 'ApiPort'
+    PUBLISH_PORTS = 'PublishPorts'; PORT_OFFSET = 'PortOffset'; BC_DEV_PORT = 'DevPort'; BC_ODATA_PORT = 'ODataPort'; BC_API_PORT = 'ApiPort'
     BC_MGMT_PORT = 'MgmtPort'; BC_CLIENT_PORT = 'ClientPort'; BC_WEBCLIENT_PORT = 'WebClientPort'; SQL_PORT = 'SqlPort'
     ENGINE = 'Engine'; REPO_PATH = 'RepoPath'; REPO_REF = 'RepoRef'
     BC_RUNNER_IMAGE = 'BcImage'; BC_SQL_IMAGE = 'SqlImage'; MSSQL_MEMORY_LIMIT_MB = 'SqlMemoryMB'
@@ -154,7 +162,7 @@ $passThroughEnv = [ordered]@{}
 
 function ConvertTo-Setting([string] $Key, [string] $Value) {
     switch ($Key) {
-        { $_ -in 'WebClient', 'PersistDatabase' } { return $Value -match '^(1|true|yes|on)$' }
+        { $_ -in 'WebClient', 'PersistDatabase', 'PublishPorts' } { return $Value -match '^(1|true|yes|on)$' }
         'Apps' { return @($Value -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
         { $_ -in 'PortOffset', 'DevPort', 'ODataPort', 'ApiPort', 'MgmtPort', 'ClientPort', 'WebClientPort', 'SqlPort', 'SqlMemoryMB', 'TimeoutMinutes', 'PublishTimeoutSeconds' } { return [int] $Value }
         default { return $Value }
@@ -186,9 +194,12 @@ if ($ContainerEnv) { foreach ($k in $ContainerEnv.Keys) { $passThroughEnv[$k] = 
 $ports = [ordered]@{
     DevPort = 7049; ODataPort = 7048; ApiPort = 7052; MgmtPort = 7045; ClientPort = 7085; WebClientPort = 8080; SqlPort = 11433
 }
+$explicitPorts = @($ports.Keys | Where-Object { $cfg.Contains($_) -and $cfg[$_] })
 foreach ($k in @($ports.Keys)) {
-    $ports[$k] = if ($cfg.Contains($k) -and $cfg[$k]) { [int] $cfg[$k] } else { $ports[$k] + [int] $cfg.PortOffset }
+    $ports[$k] = if ($k -in $explicitPorts) { [int] $cfg[$k] } else { $ports[$k] + [int] $cfg.PortOffset }
 }
+# Host ports actually published: all of them, or with -PublishPorts:$false only explicit ones.
+$publishedPorts = if ($cfg.PublishPorts) { @($ports.Keys) } else { $explicitPorts }
 
 $n = $cfg.Name
 if ($n -cnotmatch '^[a-z0-9][a-z0-9_-]*$') { throw "Invalid -Name '$n' (compose project names: lowercase letters, digits, '_', '-')." }
@@ -253,6 +264,18 @@ if ($r.ExitCode -ne 0) {
 $engineInfo = $r.Output | ConvertFrom-Json
 $isPodman = $null -ne $engineInfo.PSObject.Properties['host']     # podman's info JSON is lower-case nested
 $engineArch = if ($isPodman) { $engineInfo.host.arch } else { $engineInfo.Architecture }
+# Kiri (runkiri.com) answers http://<service>.<project>.kiri.local on port 80 with ONE container port
+# per name. A small router container (below) gives every BC endpoint its own name.
+$isKiri = -not $isPodman -and "$($engineInfo.OperatingSystem)" -eq 'Kiri'
+$hostNames = [ordered]@{}
+if ($isKiri) {
+    # .kiri.local needs 'kiri setup --domains' (writes /etc/resolver/kiri.local); .kiri.localhost always works.
+    $suffix = if ($IsMacOS -and -not (Test-Path -LiteralPath '/etc/resolver/kiri.local')) { 'kiri.localhost' } else { 'kiri.local' }
+    $hostNames.WebClientPort = "bc.$n.$suffix"
+    foreach ($e in @{ DevPort = 'dev'; ODataPort = 'odata'; ApiPort = 'api'; ClientPort = 'client' }.GetEnumerator()) {
+        $hostNames[$e.Key] = "$($e.Value).$n.$suffix"
+    }
+}
 $engineDesc = if ($isPodman) { "podman $($engineInfo.version.Version)" } else { "$($engineInfo.OperatingSystem) $($engineInfo.ServerVersion)".Trim() }
 
 $r = Invoke-Engine compose version
@@ -335,7 +358,7 @@ if ($leftContainers -or $leftVolumes) {
 }
 
 # Upstream always publishes the web client port, so check it too.
-foreach ($p in $ports.Values) {
+foreach ($p in @($publishedPorts | ForEach-Object { $ports[$_] })) {
     $l = $null
     try { $l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, $p); $l.Start() }
     catch { throw "Host port $p is already in use. Use -PortOffset or the individual -*Port parameters." }
@@ -409,7 +432,10 @@ $composeEnv = [ordered]@{
     BC_MGMT_PORT = $ports.MgmtPort; BC_CLIENT_PORT = $ports.ClientPort; BC_WEBCLIENT_PORT = $ports.WebClientPort
     SQL_PORT = $ports.SqlPort
 }
-if ($cfg.WebClient) { $composeEnv.BC_WEBCLIENT_PUBLIC_URL = "http://localhost:$($ports.WebClientPort)/" }
+if ($cfg.WebClient) {
+    $composeEnv.BC_WEBCLIENT_PUBLIC_URL = if ('WebClientPort' -notin $publishedPorts -and $hostNames.Contains('WebClientPort')) {
+        "http://$($hostNames.WebClientPort)/" } else { "http://localhost:$($ports.WebClientPort)/" }
+}
 if ($cfg.ArtifactUrl) { $composeEnv.BC_ARTIFACT_URL = $cfg.ArtifactUrl }
 if ($cfg.BcImage) { $composeEnv.BC_RUNNER_IMAGE = $cfg.BcImage }
 if ($cfg.SqlImage) { $composeEnv.BC_SQL_IMAGE = $cfg.SqlImage }
@@ -450,8 +476,22 @@ if ($bcExtraEnv.Count) {
     $yaml.Add('    environment:')
     foreach ($k in $bcExtraEnv.Keys) { $yaml.Add("      $($k): $(ConvertTo-YamlScalar $bcExtraEnv[$k])") }
 }
+$containerPorts = @{ DevPort = 7049; ODataPort = 7048; ApiPort = 7052; MgmtPort = 7045; ClientPort = 7085; WebClientPort = 8080 }
+if (-not $cfg.PublishPorts) {
+    # Replace upstream's port list with only the explicitly requested ports (Compose >= 2.24).
+    $list = @($publishedPorts | Where-Object { $containerPorts.Contains($_) } | ForEach-Object { '"{0}:{1}"' -f $ports[$_], $containerPorts[$_] })
+    $yaml.Add("    ports: !override [$($list -join ', ')]")
+}
+if ($isKiri -and $cfg.WebClient) {
+    $yaml.Add('    labels:')
+    $yaml.Add('      dev.kiri.http.port: "8080"')     # bc.<Name>.kiri.local -> web client
+}
 $yaml.Add('  sql:')
 $yaml.Add('    restart: unless-stopped')
+if (-not $cfg.PublishPorts) {
+    $sqlPorts = if ('SqlPort' -in $publishedPorts) { '"{0}:1433"' -f $ports.SqlPort } else { '' }
+    $yaml.Add("    ports: !override [$sqlPorts]")
+}
 if ($cfg.SqlImage) { $yaml.Add("    image: $(ConvertTo-YamlScalar $cfg.SqlImage)") }
 if ($cfg.PersistDatabase) {
     # Upstream keeps the database on tmpfs (fast, lost on restart). A volume keeps it, and the
@@ -461,6 +501,36 @@ if ($cfg.PersistDatabase) {
     $yaml.Add('    tmpfs: !reset []')
     $yaml.Add('    volumes:')
     $yaml.Add('      - sql-data:/var/opt/mssql')
+}
+if ($isKiri) {
+    # Router: one nginx answering dev./odata./api./client.<Name>.kiri.local and forwarding to the bc
+    # service's ports inside the compose network. Resolves 'bc' per request (Docker DNS), so it
+    # starts before bc and survives bc restarts. WebSocket upgrade for client services.
+    $routerConf = Join-Path $stateDir 'router.conf'
+    $servers = foreach ($k in 'DevPort', 'ODataPort', 'ApiPort', 'ClientPort') {
+        "server { listen 80; server_name $($hostNames[$k]); location / { set `$u http://bc:$($containerPorts[$k]); proxy_pass `$u; } }"
+    }
+    Set-Content -LiteralPath $routerConf -Encoding utf8NoBOM -Value (@(
+        '# Generated by Invoke-BcLinuxEnvironment.ps1'
+        'map $http_upgrade $conn_upgrade { default upgrade; '''' close; }'
+        'proxy_http_version 1.1;'
+        'proxy_set_header Host $host;'
+        'proxy_set_header Upgrade $http_upgrade;'
+        'proxy_set_header Connection $conn_upgrade;'
+        'proxy_read_timeout 3600s; proxy_send_timeout 3600s; client_max_body_size 0; proxy_request_buffering off;'
+        'resolver 127.0.0.11 valid=10s;'
+        'server { listen 80 default_server; return 404; }'
+    ) + $servers)
+    $yaml.Add('  router:')
+    $yaml.Add('    image: docker.io/library/nginx:alpine')
+    $yaml.Add('    restart: unless-stopped')
+    $yaml.Add('    volumes:')
+    $yaml.Add("      - $(ConvertTo-YamlScalar "$($routerConf):/etc/nginx/conf.d/default.conf:ro")")
+    $yaml.Add('    labels:')
+    $yaml.Add("      dev.kiri.domain: $(ConvertTo-YamlScalar ((('DevPort', 'ODataPort', 'ApiPort', 'ClientPort') | ForEach-Object { $hostNames[$_] }) -join ','))")
+    $yaml.Add('      dev.kiri.http.port: "80"')
+}
+if ($cfg.PersistDatabase) {          # top-level key, after all services
     $yaml.Add('volumes:')
     $yaml.Add('  sql-data:')
 }
@@ -480,7 +550,13 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
 $versionText = if ($cfg.ArtifactUrl) { $cfg.ArtifactUrl } else { "$($cfg.BcType) $($cfg.BcVersion) ($($cfg.Country))" }
 Write-Step "Creating BC environment '$n': $versionText on $engineDesc$(if ($emulated) { ' (amd64 emulation)' })"
 Write-Note "Compose files: $(($composeFiles | ForEach-Object { Split-Path -Leaf $_ }) -join ' + ')  (state: $stateDir)"
-Write-Note "Ports: dev $($ports.DevPort), OData $($ports.ODataPort), API $($ports.ApiPort), mgmt $($ports.MgmtPort), client $($ports.ClientPort), SQL $($ports.SqlPort)$(if ($cfg.WebClient) { ", web $($ports.WebClientPort)" })"
+$portText = if ($cfg.PublishPorts) {
+    "dev $($ports.DevPort), OData $($ports.ODataPort), API $($ports.ApiPort), mgmt $($ports.MgmtPort), client $($ports.ClientPort), SQL $($ports.SqlPort)$(if ($cfg.WebClient) { ", web $($ports.WebClientPort)" })"
+} elseif ($publishedPorts) { "only $(($publishedPorts | ForEach-Object { "$_ $($ports[$_])" }) -join ', ')" } else { 'none published' }
+Write-Note "Ports: $portText$(if ($hostNames.Count) { "  (names: *.$n.$suffix)" })"
+if (-not $cfg.PublishPorts -and -not $hostNames.Count) {
+    Write-Warning "No ports are published and $engineDesc has no container names, so BC is reachable only from inside the compose network ($engineExe exec)."
+}
 if ($licensePath) { Write-Note "License: $licensePath" }
 if ($appFiles.Count) { Write-Note "Extensions: $($appFiles.Count) to publish after startup" }
 
@@ -514,8 +590,12 @@ if (-not $bcContainer) { throw 'compose up returned, but no bc container exists.
 # Wait for readiness
 # ---------------------------------------------------------------------------
 $pair = "$($cfg.Username):$($cfg.Password)"
-$authHeader = @{ Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair)) }
-$odataUrl = "http://localhost:$($ports.ODataPort)/BC/ODataV4/Company"
+# BC endpoints are queried from INSIDE the bc container (its own localhost), so the script works
+# the same whether or not host ports are published.
+function Invoke-BcGet([int] $ContainerPort, [string] $Path) {
+    $r = Invoke-Engine exec $bcContainer curl -sf --max-time 60 -u $pair "http://localhost:$ContainerPort$Path"
+    if ($r.ExitCode -eq 0 -and $r.Output) { try { $r.Output | ConvertFrom-Json } catch { $null } }
+}
 
 Write-Step "Waiting for the service tier (first boot downloads ~2 GB of artifacts; up to $($cfg.TimeoutMinutes) min)"
 $deadline = (Get-Date).AddMinutes($cfg.TimeoutMinutes)
@@ -528,10 +608,8 @@ while ($true) {
         throw "BC container stopped (state: $state). Last log lines:`n$logs"
     }
     if ((Invoke-Engine exec $bcContainer test -f /tmp/bc-ready).ExitCode -eq 0) {
-        try {
-            $resp = Invoke-RestMethod -Uri $odataUrl -Headers $authHeader -TimeoutSec 30
-            if ($resp.value) { break }
-        } catch { }
+        $resp = Invoke-BcGet 7048 '/BC/ODataV4/Company'
+        if ($resp -and $resp.value) { break }
     }
     $line = ((Invoke-Engine logs --tail 1 $bcContainer).Output -split "`n" | Select-Object -Last 1)
     if ($line -and $line -ne $lastLine -and $line -match '^\[(entrypoint|artifacts)\]') { Write-Note $line; $lastLine = $line }
@@ -613,12 +691,10 @@ if ($appFiles.Count) {
 
     # Verify through the automation API that each app is installed.
     try {
-        $apiBase = "http://localhost:$($ports.ApiPort)/BC/api"
-        $companyId = (Invoke-RestMethod -Headers $authHeader -TimeoutSec 60 -Uri "$apiBase/v2.0/companies").value[0].id
+        $companyId = (Invoke-BcGet 7052 '/BC/api/v2.0/companies').value[0].id
         # isInstalled is not filterable server-side; filter it here.
         $filter = [Uri]::EscapeDataString("publisher ne 'Microsoft'")
-        $exts = Invoke-RestMethod -Headers $authHeader -TimeoutSec 60 `
-            -Uri "$apiBase/microsoft/automation/v2.0/companies($companyId)/extensions?`$filter=$filter"
+        $exts = Invoke-BcGet 7052 "/BC/api/microsoft/automation/v2.0/companies($companyId)/extensions?`$filter=$filter"
         foreach ($e in $exts.value) {
             $v = "$($e.versionMajor).$($e.versionMinor).$($e.versionBuild).$($e.versionRevision)"
             if ($e.isInstalled) { Write-Note "installed: $($e.publisher) / $($e.displayName) $v" }
@@ -633,17 +709,31 @@ if ($appFiles.Count) {
 Write-Step "Environment '$n' is ready ($([int]$sw.Elapsed.TotalMinutes) min)"
 $fileHint = ($composeFiles | ForEach-Object { '-f "{0}"' -f $_ }) -join ' '
 $composeHint = ('{0} {1} -p {2} {3} --env-file "{4}"' -f $composeExe, ($composePrefix -join ' '), $n, $fileHint, $composeEnvFile).Replace('  ', ' ')
+# Name first (Kiri), then localhost if that port is published.
+function Get-Endpoint([string] $Key, [string] $Path, [string] $Scheme = 'http') {
+    $urls = @()
+    if ($hostNames.Contains($Key)) { $urls += "$($Scheme)://$($hostNames[$Key])$Path" }
+    if ($Key -in $publishedPorts) { $urls += "$($Scheme)://localhost:$($ports[$Key])$Path" }
+    if ($urls) { $urls -join '   ' } else { "(not published; -$Key <port> publishes it)" }
+}
 $summary = [ordered]@{
-    Engine     = "$engineExe (compose project '$n')"
+    Engine     = "$engineDesc (compose project '$n')"
     Version    = $versionText
-    WebClient  = $(if ($cfg.WebClient) { "http://localhost:$($ports.WebClientPort)/" } else { '(disabled)' })
-    Dev        = "http://localhost:$($ports.DevPort)/BC/dev"
-    OData      = "http://localhost:$($ports.ODataPort)/BC/ODataV4"
-    Api        = "http://localhost:$($ports.ApiPort)/BC/api/v2.0"
-    Sql        = "localhost,$($ports.SqlPort) (sa)"
+    WebClient  = $(if ($cfg.WebClient) { Get-Endpoint WebClientPort '/' } else { '(disabled)' })
+    Dev        = Get-Endpoint DevPort '/BC/dev'
+    OData      = Get-Endpoint ODataPort '/BC/ODataV4'
+    Api        = Get-Endpoint ApiPort '/BC/api/v2.0'
+    Client     = Get-Endpoint ClientPort '/BC' 'ws'
+    Sql        = $(if ('SqlPort' -in $publishedPorts) { "localhost,$($ports.SqlPort) (sa)" } else { '(not published; -SqlPort <port> publishes it)' })
     Username   = $cfg.Username
     Extensions = ($installed -join ', ')
     Compose    = "$composeHint <logs|stop|start|ps>"
     Remove     = "./Invoke-BcLinuxEnvironment.ps1 -Name $n -Remove"
+}
+if ($hostNames.Count) {
+    $summary.Remove('Remove'); $summary.Remove('Compose')
+    $summary['AL launch'] = "`"server`": `"http://$($hostNames.DevPort)`", `"port`": 80, `"serverInstance`": `"BC`", `"authentication`": `"UserPassword`""
+    $summary['Compose'] = "$composeHint <logs|stop|start|ps>"
+    $summary['Remove'] = "./Invoke-BcLinuxEnvironment.ps1 -Name $n -Remove"
 }
 $summary.GetEnumerator() | ForEach-Object { Write-Host ('  {0,-11} {1}' -f $_.Key, $_.Value) }
