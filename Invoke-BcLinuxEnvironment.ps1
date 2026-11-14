@@ -191,7 +191,7 @@ foreach ($k in @($ports.Keys)) {
 }
 
 $n = $cfg.Name
-if ($n -notmatch '^[a-z0-9][a-z0-9_-]*$') { throw "Invalid -Name '$n' (compose project names: lowercase letters, digits, '_', '-')." }
+if ($n -cnotmatch '^[a-z0-9][a-z0-9_-]*$') { throw "Invalid -Name '$n' (compose project names: lowercase letters, digits, '_', '-')." }
 $stateRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.bcvm'
 $stateDir = Join-Path $stateRoot $n
 
