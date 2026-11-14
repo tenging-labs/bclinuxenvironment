@@ -15,10 +15,8 @@ apps/
 .env
 
 # --- Third-party content ----------------------------------------------------
-# LS Retail releases and demo data: configuration packages, retail images, etc.
+# Configuration packages (demo data from Microsoft or ISV releases).
 *.rapidstart
-ls-central-*-demo-data-package/
-LS Central for pharmacies */
 
 # --- OS / editor ------------------------------------------------------------
 .DS_Store

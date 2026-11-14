@@ -32,7 +32,7 @@
         -LicenseFile ./dev.bclicense -Apps './apps/a.app;./apps/b.app'
 
 .EXAMPLE
-    ./Invoke-BcLinuxEnvironment.ps1 -EnvFile ./bc285-lscentral.env
+    ./Invoke-BcLinuxEnvironment.ps1 -EnvFile ./example.env
 
 .EXAMPLE
     ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -Remove     # compose down -v: containers and volumes

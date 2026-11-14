@@ -1,4 +1,4 @@
-# bcvm: Business Central environments in Docker or Podman
+# bclinuxenvironment: Business Central environments in Docker or Podman
 
 `Invoke-BcLinuxEnvironment.ps1` creates a Microsoft Dynamics 365 Business Central environment in a
 local container engine. It then installs your extensions (`.app` files) in the order you
@@ -23,13 +23,13 @@ Work in progress (configuration packages and other open items) is tracked in
 ## Quick start
 
 ```powershell
-# BC 28.5 W1 with the web client and LS Central, as defined in an env file
-./Invoke-BcLinuxEnvironment.ps1 -EnvFile ./bc285-lscentral.env
+# BC 28.5 W1 with the web client, as defined in an env file
+./Invoke-BcLinuxEnvironment.ps1 -EnvFile ./example.env
 
-# Same thing with parameters only (apps: one string, ';'-separated, installed in that order)
+# With a partner license and your apps (one string, ';'-separated, installed in that order)
 ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -BcVersion 28.5 -Country w1 `
-    -LicenseFile ./BC28_1272026_6205373.bclicense `
-    -Apps './apps/LS Retail_LS Central System App_28.2.0.1847_runtime.app;./apps/LS Retail_LS Central_28.2.0.1847.app;./apps/LS Retail_LS Central for pharmacies_28.1.0.1199.app'
+    -LicenseFile ./dev.bclicense `
+    -Apps './apps/Dependency.app;./apps/MyApp.app'
 
 # Remove it again (containers, network, volumes, state)
 ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -Remove
@@ -53,13 +53,14 @@ When the script finishes, it prints the endpoints:
 ## Run without cloning
 
 The script is a single self-contained file (it fetches the upstream compose files itself), so
-it can run straight from the private GitHub repo. You need:
+it can run straight from GitHub. No account or token is needed. You only need **PowerShell 7**
+(`pwsh`) installed; it runs the script whichever shell you start from.
 
-- **PowerShell 7** (`pwsh`) installed. It runs the script whichever shell you start from.
-- Access to `tenging-labs/LinuxBCContainer`, either:
-  - through the **GitHub CLI**: `gh auth login` once, or
-  - with a fine-grained **personal access token** with *Contents: read* on the repo (see
-    [Without the GitHub CLI](#without-the-github-cli)).
+The script URL is:
+
+```text
+https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1
+```
 
 Paths you pass (license, apps, `-EnvFile`) are local files and resolve against your **current
 directory**. The parameters are the same as for `./Invoke-BcLinuxEnvironment.ps1`; see
@@ -75,32 +76,32 @@ directory**. The parameters are the same as for `./Invoke-BcLinuxEnvironment.ps1
 Everything after the closing `)))` is the normal parameter list:
 
 ```powershell
-# BC 28.5 W1 + partner license + LS Central apps, installed in this order
-& ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' }))) -Name bc285 -BcVersion 28.5 -Country w1 `
-    -LicenseFile ./BC28_1272026_6205373.bclicense `
-    -Apps './apps/LS Retail_LS Central System App_28.2.0.1847_runtime.app;./apps/LS Retail_LS Central_28.2.0.1847.app;./apps/LS Retail_LS Central for pharmacies_28.1.0.1199.app'
+# BC 28.5 W1 + partner license + your apps, installed in this order
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name bc285 -BcVersion 28.5 -Country w1 `
+    -LicenseFile ./dev.bclicense `
+    -Apps './apps/Dependency.app;./apps/MyApp.app'
 
 # A plain BC 29.0 next to it (every port +100: web 8180, dev 7149, OData 7148, SQL 11533, ...)
-& ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' }))) -Name bc290 -BcVersion 29.0 -PortOffset 100
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name bc290 -BcVersion 29.0 -PortOffset 100
 
 # Everything from an env file, on a third set of ports (+200)
-& ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' }))) -EnvFile ./bc285-lscentral.env -PortOffset 200
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -EnvFile ./my.local.env -PortOffset 200
 
 # All apps from a folder, German localization, no web client
-& ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' }))) -Name bc285de -BcVersion 28.5 -Country de -Apps ./apps -LicenseFile ./dev.bclicense -WebClient:$false
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name bc285de -BcVersion 28.5 -Country de -Apps ./apps -LicenseFile ./dev.bclicense -WebClient:$false
 
 # Throw-away environment: in-memory database, replaces an existing one of the same name
-& ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' }))) -Name scratch -BcVersion 28.5 -PersistDatabase:$false -Recreate
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name scratch -BcVersion 28.5 -PersistDatabase:$false -Recreate
 
 # Remove an environment (containers, volumes, ~/.bcvm/<Name>)
-& ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' }))) -Name bc290 -Remove
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1))) -Name bc290 -Remove
 ```
 
 **As a command for the session.** Load the script once per session, or put the first line in
 your `$PROFILE`. Then `Invoke-BcLinuxEnvironment` works like the script, with tab completion:
 
 ```powershell
-Set-Item function:global:Invoke-BcLinuxEnvironment ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1' -Headers @{ Authorization = "Bearer $(gh auth token)"; Accept = 'application/vnd.github.raw' })))
+Set-Item function:global:Invoke-BcLinuxEnvironment ([scriptblock]::Create((irm https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1)))
 
 Invoke-BcLinuxEnvironment -Name bc290 -BcVersion 29.0 -PortOffset 100
 Invoke-BcLinuxEnvironment -Name bc290 -Remove
@@ -115,7 +116,7 @@ every parameter natively.
 Download to a temp file and run it with `pwsh -File`. As a one-liner:
 
 ```bash
-gh api repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1 -H 'Accept: application/vnd.github.raw' > "${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1" && pwsh -NoProfile -File "${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1" -Name bc290 -BcVersion 29.0 -PortOffset 100
+curl -fsSL https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1 -o "${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1" && pwsh -NoProfile -File "${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1" -Name bc290 -BcVersion 29.0 -PortOffset 100
 ```
 
 For regular use, add a function to `~/.zshrc` or `~/.bashrc`. It fetches the latest script on
@@ -124,18 +125,18 @@ every call:
 ```bash
 bclinux() {
   local f="${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1"
-  gh api repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1 \
-    -H 'Accept: application/vnd.github.raw' > "$f" && pwsh -NoProfile -File "$f" "$@"
+  curl -fsSL https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1 -o "$f" \
+    && pwsh -NoProfile -File "$f" "$@"
 }
 ```
 
 ```bash
 bclinux -Name bc285 -BcVersion 28.5 -Country w1 \
-  -LicenseFile ./BC28_1272026_6205373.bclicense \
-  -Apps './apps/LS Retail_LS Central System App_28.2.0.1847_runtime.app;./apps/LS Retail_LS Central_28.2.0.1847.app;./apps/LS Retail_LS Central for pharmacies_28.1.0.1199.app'
+  -LicenseFile ./dev.bclicense \
+  -Apps './apps/Dependency.app;./apps/MyApp.app'
 
 bclinux -Name bc290 -BcVersion 29.0 -PortOffset 100
-bclinux -EnvFile ./bc285-lscentral.env -PortOffset 200
+bclinux -EnvFile ./my.local.env -PortOffset 200
 bclinux -Name bc285de -BcVersion 28.5 -Country de -Apps ./apps '-WebClient:$false'
 bclinux -Name bc290 -Remove
 ```
@@ -152,7 +153,7 @@ Quoting in zsh/bash:
 ```fish
 function bclinux
     set -l f /tmp/Invoke-BcLinuxEnvironment.ps1
-    gh api repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1 -H 'Accept: application/vnd.github.raw' > $f
+    curl -fsSL https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1 -o $f
     and pwsh -NoProfile -File $f $argv
 end
 ```
@@ -161,45 +162,31 @@ Usage and quoting are the same as for bash. Not tested yet.
 
 ### Windows Command Prompt (cmd.exe)
 
+`curl.exe` ships with Windows 10 and later:
+
 ```bat
-gh api repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1 -H "Accept: application/vnd.github.raw" > "%TEMP%\Invoke-BcLinuxEnvironment.ps1" && pwsh -NoProfile -File "%TEMP%\Invoke-BcLinuxEnvironment.ps1" -Name bc290 -BcVersion 29.0 -PortOffset 100
+curl -fsSL https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1 -o "%TEMP%\Invoke-BcLinuxEnvironment.ps1" && pwsh -NoProfile -File "%TEMP%\Invoke-BcLinuxEnvironment.ps1" -Name bc290 -BcVersion 29.0 -PortOffset 100
 ```
 
 Use double quotes for values with spaces (`-Apps "a.app;b.app"`). `-WebClient:$false` needs no
-quoting in cmd. Line continuation is `^`.
+quoting in cmd. Line continuation is `^`. Not tested yet.
 
 ### Windows PowerShell 5.1
 
 The script needs PowerShell 7. Type `pwsh` to start a PowerShell 7 session, then use the
 [PowerShell 7](#powershell-7-windows-macos-linux) examples.
 
-### Without the GitHub CLI
-
-Create a fine-grained personal access token (*Contents: read* on
-`tenging-labs/LinuxBCContainer`) and put it in `GITHUB_TOKEN`:
-
-```powershell
-# PowerShell 7: replace $(gh auth token) with $env:GITHUB_TOKEN
-$env:GITHUB_TOKEN = '<token>'
-& ([scriptblock]::Create((irm 'https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1' -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github.raw' }))) -Name bc290 -BcVersion 29.0 -PortOffset 100
-```
-
-```bash
-# zsh / bash: replace the gh api call with curl
-export GITHUB_TOKEN='<token>'
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github.raw' \
-  https://api.github.com/repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1 \
-  -o "${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1" && pwsh -NoProfile -File "${TMPDIR:-/tmp}/Invoke-BcLinuxEnvironment.ps1" -Name bc290 -BcVersion 29.0 -PortOffset 100
-```
-
 ### Pin a version
 
-For reproducible runs, add `?ref=<tag, branch or commit>` to the path. This works for both the
-`irm` URL and the `gh api` path:
+`main` always gives the latest script. For reproducible runs, replace `main` in the URL with a
+tag or commit:
 
-```bash
-gh api 'repos/tenging-labs/LinuxBCContainer/contents/Invoke-BcLinuxEnvironment.ps1?ref=v1.0.0' -H 'Accept: application/vnd.github.raw' > ...
+```text
+https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/v1.0.0/Invoke-BcLinuxEnvironment.ps1
 ```
+
+GitHub caches raw files for a few minutes, so a push to `main` can take up to about 5 minutes
+to show up at the URL.
 
 ---
 
@@ -270,21 +257,20 @@ Relative paths in an env file (apps, license) are resolved against the env file'
 
 ### Example env file
 
-[`bc285-lscentral.env`](bc285-lscentral.env):
+[`example.env`](example.env). Copy it for your own settings; files named `*.local.env` are
+git-ignored, so personal copies (with license paths and app lists) stay out of the repo.
 
 ```ini
 NAME=bc285
 BC_VERSION=28.5
 BC_COUNTRY=w1
 BC_TYPE=sandbox
-BC_SERVER_USERNAME=BCRUNNER
-BC_SERVER_PASSWORD=Admin123!
 
-# Partner developer license, required for the LS Retail apps (relative to this file).
-BC_LICENSE_HOST_PATH=./BC28_1272026_6205373.bclicense
+# Optional license, e.g. a partner developer license for ISV apps (relative to this file).
+BC_LICENSE_HOST_PATH=./dev.bclicense
 
-# Published in this order.
-APPS=apps/LS Retail_LS Central System App_28.2.0.1847_runtime.app;apps/LS Retail_LS Central_28.2.0.1847.app;apps/LS Retail_LS Central for pharmacies_28.1.0.1199.app
+# Published in this order (semicolon-separated; files or folders, relative to this file).
+APPS=apps/Dependency.app;apps/MyApp.app
 
 # Any other key goes straight to the BC container:
 # BC_SERVER_SETTINGS=DisableWriteInsideTryFunctions=false
@@ -319,7 +305,7 @@ Give each one its own name and port offset:
 - At the end, the script lists every non-Microsoft extension from the automation API and
   warns about any that are published but not installed.
 
-Large apps take a while under emulation: LS Central 28.2 took 220–300 s on an M-series Mac.
+Large apps take a while under emulation: a large ISV app (LS Central 28.2) took 220–300 s on an M-series Mac.
 
 ---
 
@@ -398,7 +384,7 @@ docker compose -p bc285 \
 | `No running container engine found` | Start Docker Desktop, or run `podman machine start`. |
 | `Host port N is already in use` | Use `-PortOffset` or the individual port parameters. |
 | BC container exits with code 133 and `rosetta error` in the logs | Emulation without the .NET fixes. They are applied automatically on ARM; if you override `-ContainerEnv`, keep `DOTNET_INTERNAL_ThreadSuspendInjection=0`. |
-| LS (or other ISV) apps fail to publish with license / object-range errors | Pass the partner license with `-LicenseFile` / `BC_LICENSE_HOST_PATH`. |
+| ISV apps fail to publish with license / object-range errors | Pass the partner license with `-LicenseFile` / `BC_LICENSE_HOST_PATH`. |
 | `Text optimized index cannot be created … Full-Text Search component is not installed` | An app (or creating a new company) needs SQL Full-Text Search. Use an FTS-capable SQL image via `-SqlImage`; see [docs/ROADMAP.md](docs/ROADMAP.md) for the ARM build. |
 | Timeout waiting for BC | `docker logs <Name>-bc-1`. A first boot under emulation takes 3–5 min; slow artifact downloads add to that. |
 
@@ -407,8 +393,9 @@ docker compose -p bc285 \
 ## Validation
 
 Validated end to end on macOS (Apple Silicon, Docker Desktop 4.94, Compose v5.5.1):
-BC sandbox 28.5.54151.58046 W1, web client, partner license, LS Central System App
-28.2.0.1847 (runtime) → LS Central 28.2.0.1847 → LS Central for pharmacies 28.1.0.1199.
+BC sandbox 28.5.54151.58046 W1, web client, a partner license, and three ISV apps
+published in dependency order (LS Central System App runtime → LS Central → LS Central for
+pharmacies).
 Total 9 min:
 
 - 3 min to a ready service tier, including the artifact download
@@ -423,10 +410,10 @@ Persistence across stop/start was also verified.
 | Path | Purpose |
 |---|---|
 | `Invoke-BcLinuxEnvironment.ps1` | The script. `Get-Help ./Invoke-BcLinuxEnvironment.ps1 -Detailed` for built-in help. |
-| `bc285-lscentral.env` | Example env file for the BC 28.5 + LS Central test bench. |
+| `example.env` | Example env file. Personal copies: `*.local.env` (git-ignored). |
 | `docs/ROADMAP.md` | Findings, work in progress and backlog. |
-| `apps/` | *Local only, git-ignored.* Extensions for the test bench (`*.app`). |
+| `apps/` | *Local only, git-ignored.* Your extensions (`*.app`). |
 | `*.bclicense` | *Local only, git-ignored.* License files, e.g. the partner developer license. |
-| LS Retail packages | *Local only, git-ignored.* Configuration packages (`*.rapidstart`) and the LS Central / pharmacy release folders. |
-| `experiments/` | *Local only, git-ignored.* Prototypes for the configuration-package work, see [docs/ROADMAP.md](docs/ROADMAP.md). |
+| `*.rapidstart` | *Local only, git-ignored.* Configuration packages. |
+| `experiments/` | *Local only, git-ignored.* Scratch space for prototypes. |
 | `~/.bcvm/` | Cached upstream repo and per-environment state (outside the project). |
