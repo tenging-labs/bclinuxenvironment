@@ -113,11 +113,15 @@ Cross-cutting rules:
 - **Persistence:** SQL data lives in the `sql-data` volume (SQL runs as `0:0`). The upstream
   entrypoint reuses an existing `CRONUS` DB, so stop/start keeps installed apps.
 
-## Environment facts (maintainer's test machine: Apple Silicon, Docker Desktop)
+## Environment facts (maintainer's test machine: Apple Silicon)
 
-- **CLI pulls from ghcr fail** with a keychain credential-helper error in non-interactive shells. The
-  script warns and uses cached images. Pulling via the engine API socket
-  (`~/.docker/run/docker.sock`, `POST /images/create`) works.
+- **Engine: Kiri only** (runkiri.com, 0.2.0). Docker Desktop and Podman were removed on 2026-11-14.
+  - CLI `~/.kiri/bin/docker` (appended to the END of PATH by `~/.zshrc`/`~/.zprofile`), socket
+    `~/.kiri/run/docker.sock`, default context `kiri`, compose/buildx from Kiri.app's cli-plugins.
+  - VM: 10 CPUs, 20 GB memory ceiling (`~/.kiri/vm.json`; ballooned, sleeps when idle). amd64 via
+    Rosetta. `docker info`: `OperatingSystem: Kiri`, `Architecture: aarch64`.
+  - No `credsStore` in `~/.docker/config.json`, so registry logins are stored there in plain form.
+  - Validated: BC 29.1 W1 (`latest`) ready in 3 min, `-Remove` leaves nothing behind.
 - **ISV apps need a partner license** (`BC_LICENSE_HOST_PATH`). License files are git-ignored and
   only referenced from git-ignored `*.local.env` files.
 - **Never swap the SQL container under a running BC tier.** It broke the NST task scheduler

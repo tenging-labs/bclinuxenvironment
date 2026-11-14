@@ -23,10 +23,15 @@ Status as of 2026-11-14. Usage of what works today is in [README.md](../README.m
    upstream macOS overlay pins CU17 (16.0.4175.1).
 3. **ISV apps need a partner license** (`BC_LICENSE_HOST_PATH`). It is imported before the
    service tier starts.
-4. **Keychain error on pull.** `docker pull` from ghcr can fail on macOS with a keychain
-   credential-helper error in non-interactive sessions, even though the image is public.
-   The script falls back to cached images. Pulling through the Docker engine API (unix
-   socket) works if an automatic refresh is ever needed.
+4. **Credential helper breaks pulls.** A `credsStore` helper that is missing (`desktop` left
+   behind after switching to Kiri) or can't reach the keychain fails every pull, even of public
+   images. Upstream's `bc` service then falls back to its `build:` section and builds the runner
+   from source, and that local image shadows the published one afterwards (`pull_policy:
+   missing`). The script now runs `compose up --no-build` and names the credential problem.
+7. **Kiri works as the engine.** Docker-compatible, Rosetta for amd64. Leftovers of an
+   uninstalled Docker Desktop (dangling `/usr/local/bin/docker`, stale `desktop-linux`
+   context) made the script pick a dead CLI/engine; detection now skips dangling links and
+   reports the context.
 5. **`podman compose` lacks `--wait`.** That is why the script does its own readiness
    polling instead.
 6. **Database lost on restart upstream.** Upstream keeps the database on tmpfs. The
@@ -141,10 +146,8 @@ CONFIG_PACKAGES=packages/NAV28.0.W1.ENU.EXTENDED.rapidstart;feature:SalesPrices;
 - **Stale `/tmp/bc-ready`:** after `compose restart` the marker is stale until the
   entrypoint clears it. The script's wait also requires OData, so it's not affected, but
   ad-hoc checks are.
-- **Wrong `-BcImage` builds from source:** upstream's compose has a `build:` section with
-  `pull_policy: missing`, so an image name that can't be pulled is silently built from upstream
-  `src/Dockerfile` (about 2 min) instead of failing. Consider checking that the image exists or
-  pulls before `compose up`.
-- **Image refresh:** consider pulling through the engine API when the CLI pull fails on a
-  credential helper.
+- **Image refresh:** consider pulling anonymously (engine API) when the CLI pull fails on a
+  credential helper; today the script names the cause and uses cached images.
+- **Podman with libkrun** (default provider on new Podman for macOS): amd64 runs under qemu-user,
+  not Rosetta. Untested; SQL Server may not run under qemu.
 - **Report upstream:** the Rosetta .NET crash and its fix; CU17-based FTS for Apple Silicon.

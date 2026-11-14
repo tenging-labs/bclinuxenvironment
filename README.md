@@ -8,7 +8,7 @@ It is built on [MsDyn365Bc.On.Linux](https://github.com/aldevtools/MsDyn365Bc.On
 which runs the unmodified BC service tier on Linux. The script uses that project's
 supported workflow (`docker compose up`) and adds what the upstream workflow leaves to you:
 
-- picks the container engine and compose command
+- uses your docker CLI and its current context (Docker Desktop, Kiri, OrbStack, Docker Engine, …) or Podman
 - handles emulation on ARM machines
 - supports a partner license
 - keeps the database across restarts
@@ -217,10 +217,10 @@ to show up at the URL.
 | Requirement | Notes |
 |---|---|
 | PowerShell 7.2+ (`pwsh`) | Windows PowerShell 5.1 is not supported (the script uses `Invoke-WebRequest -Form`). |
-| Docker **or** Podman, running | Detected automatically; Docker is tried first. Override with `-Engine`. |
-| Compose v2 | `docker compose`, `podman compose` (with `docker-compose` as its provider) or a standalone `docker-compose`. |
+| A Docker-compatible engine **or** Podman, running | `docker` is used with its **current context**: Docker Desktop, [Kiri](https://runkiri.com/), OrbStack, Colima, Docker Engine, … Podman is used when no `docker` CLI exists, or with `-Engine podman`. |
+| Compose v2 | `docker compose` (bundled with Docker Desktop and Kiri), or `podman compose` with `docker-compose` as its provider. |
 | `git` (optional) | Fetches the upstream repo. Without git, the script downloads a zip from GitHub instead. |
-| Memory | About 6 GB free for the containers (SQL 3 GB + BC 2–3 GB). On Docker Desktop / podman machine, give the VM 12–16 GB. |
+| Memory | About 6 GB free for the containers (SQL 3 GB + BC 2–3 GB). On Docker Desktop / Kiri / podman machine, give the VM 12–16 GB. |
 | Disk | About 5 GB per environment (artifacts, service tier, database), plus about 2 GB of images. |
 
 ### Apple Silicon / ARM hosts
@@ -230,6 +230,7 @@ detects this and applies the needed fixes automatically (see
 [What the script does](#what-the-script-does)).
 
 - **Docker Desktop:** enable *Use Rosetta for x86_64/amd64 emulation* in Settings → General.
+- **Kiri:** uses Rosetta automatically; install it once with `softwareupdate --install-rosetta`.
 - **Podman:** the machine must be **rootful** and created with Rosetta enabled. See
   upstream [MacOS.md](https://github.com/aldevtools/MsDyn365Bc.On.Linux/blob/master/MacOS.md).
   The script warns if the podman machine is rootless.
@@ -265,7 +266,7 @@ Relative paths in an env file (apps, license) are resolved against the env file'
 | `-ContainerEnv` | any other key | – | Extra environment variables for the BC container (hashtable). In an env file, every unknown key is passed through, e.g. `BC_SERVER_SETTINGS=…`. |
 | `-PortOffset` | `PORT_OFFSET` | `0` | Added to every default port, so several environments can run side by side. |
 | `-DevPort` `-ODataPort` `-ApiPort` `-MgmtPort` `-ClientPort` `-WebClientPort` `-SqlPort` | `BC_DEV_PORT` … `SQL_PORT` | 7049 / 7048 / 7052 / 7045 / 7085 / 8080 / 11433 | Individual host ports (override the offset). |
-| `-Engine` | `ENGINE` | `auto` | `auto`, `docker` or `podman`. |
+| `-Engine` | `ENGINE` | `auto` | `auto` (`docker` if its CLI exists, else `podman`), `docker` or `podman`. `docker` follows its current context (`DOCKER_CONTEXT` / `docker context use`), so Kiri, OrbStack etc. need no option. |
 | `-RepoPath` | `REPO_PATH` | `~/.bcvm/MsDyn365Bc.On.Linux` | Use your own clone of the upstream repo. |
 | `-RepoRef` | `REPO_REF` | `master` | Branch or tag to fetch when no `-RepoPath` is given. |
 | `-BcImage` | `BC_RUNNER_IMAGE` | upstream `bc-runner:latest` | Override the BC image. |
@@ -335,8 +336,10 @@ Large apps take a while under emulation: a large ISV app (LS Central 28.2) took 
 ## What the script does
 
 1. **Settings:** merges defaults, env file, `BCVM_*` variables and parameters.
-2. **Engine:** finds a running Docker or Podman. `docker` may be podman's alias; it is
-   detected through `docker --version`. Then it finds a compose command.
+2. **Engine:** takes the `docker` CLI (skipping dangling links left by an uninstalled Docker
+   Desktop; Kiri's `~/.kiri/bin/docker` is found even when it is not on `PATH`), else `podman`.
+   One `info` call checks the engine is reachable and reads its architecture; one
+   `compose version` call checks compose.
 3. **Checks:** the app and license files exist, all host ports are free, and no
    environment of that name exists (unless `-Recreate`).
    With `-BcVersion latest` (the default) it then reads Microsoft's public artifact index
@@ -405,8 +408,9 @@ docker compose -p bc285 \
 
 | Symptom | Cause / fix |
 |---|---|
-| `Pull failed, using the image already present locally … keychain cannot be accessed` | On macOS the Docker CLI's credential helper can't read the keychain from a non-interactive session. The images are public. The script carries on with cached images; to refresh, run `docker pull ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest` from an interactive terminal. |
-| `No running container engine found` | Start Docker Desktop, or run `podman machine start`. |
+| `The docker credential helper fails` / `error getting credentials … docker-credential-desktop: executable file not found` | `credsStore` in `~/.docker/config.json` names a helper that is gone (typically `desktop` after switching from Docker Desktop to Kiri or another engine) or can't read the keychain from a non-interactive session. The images are public: remove the `credsStore` line, or fix the helper. The script carries on with cached images if it can. |
+| `The container engine is not reachable … The docker context is 'desktop-linux'` | The current docker context points at an engine that isn't running or no longer exists. Start it, or switch, e.g. `docker context use kiri` (Kiri: `kiri setup --use`). |
+| `compose up failed … pull access denied` / image not found | The runner image couldn't be pulled and isn't cached. The script never builds it from source (`--no-build`); fix the pull (see above) or `-BcImage`. If an earlier run of another tool built `bc-runner:latest` locally, `docker rmi ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest` and pull again. |
 | `Host port N is already in use` | Use `-PortOffset` or the individual port parameters. |
 | BC container exits with code 133 and `rosetta error` in the logs | Emulation without the .NET fixes. They are applied automatically on ARM; if you override `-ContainerEnv`, keep `DOTNET_INTERNAL_ThreadSuspendInjection=0`. |
 | ISV apps fail to publish with license / object-range errors | Pass the partner license with `-LicenseFile` / `BC_LICENSE_HOST_PATH`. |

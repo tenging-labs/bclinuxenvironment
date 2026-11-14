@@ -6,8 +6,8 @@
 .DESCRIPTION
     The script follows the supported MsDyn365Bc.On.Linux workflow (docker compose up) and
     adds what that workflow leaves to the user:
-      1. Detects the container engine (docker or podman; override with -Engine) and its
-         compose command (`docker compose`, `podman compose`, or `docker-compose`).
+      1. Uses the docker CLI and its current context (Docker Desktop, Docker Engine, Kiri,
+         OrbStack, ...) or podman (override with -Engine), with its compose plugin.
       2. Fetches the upstream repository once (git clone, or a zip download without git)
          into a cache folder, or uses -RepoPath.
       3. Runs `compose up` with the upstream docker-compose.yml, the upstream macOS
@@ -220,31 +220,43 @@ function Assert-Ok($Result, [string] $What) {
     $Result.Output
 }
 
-$engineExe = $null
-$candidates = if ($cfg.Engine -eq 'auto') { @('docker', 'podman') } else { @($cfg.Engine) }
-foreach ($c in $candidates) {
-    if (-not (Get-Command $c -CommandType Application -ErrorAction SilentlyContinue)) { continue }
-    $ctx.EngineExe = $c
-    if ((Invoke-Engine info).ExitCode -eq 0) { $engineExe = $c; break }
-    Write-Note "$c is installed but its engine is not reachable (start Docker Desktop / 'podman machine start')."
-    $ctx.EngineExe = $null
+# One CLI, one `info`, one `compose version`. `docker` covers Docker Desktop, Docker Engine,
+# Kiri, OrbStack, Colima, ... (whatever the current docker context points at).
+$engineName = if ($cfg.Engine -eq 'auto') { 'docker' } else { $cfg.Engine }
+# Symlinks are resolved to their final target: uninstalling Docker Desktop leaves dangling links such as
+# /usr/local/bin/docker, which Get-Command still returns. Kiri links its CLI into ~/.kiri/bin,
+# which its profile lines append to the END of PATH (and only for login/interactive zsh).
+function Find-Cli([string] $Name, [string[]] $Extra) {
+    @(Get-Command $Name -CommandType Application -All -ErrorAction SilentlyContinue | ForEach-Object Source) + $Extra |
+        Where-Object { $_ -and ([IO.FileInfo]::new($_).ResolveLinkTarget($true) ?? [IO.FileInfo]::new($_)).Exists } |
+        Select-Object -First 1
 }
-if (-not $engineExe) { throw "No running container engine found (tried: $($candidates -join ', '))." }
-# `docker` may be podman's docker-compatible alias (podman-docker); --version tells them apart.
-$isPodman = (Invoke-Engine --version).Output -match 'podman'
+$cmd = Find-Cli $engineName $(if ($engineName -eq 'docker') { Join-Path $HOME '.kiri/bin/docker' })
+if (-not $cmd -and $cfg.Engine -eq 'auto') { $engineName = 'podman'; $cmd = Find-Cli podman }
+if (-not $cmd) { throw 'No container CLI found. Install Docker, Kiri or Podman (or pass -Engine docker|podman).' }
+$engineExe = $cmd
+$ctx.EngineExe = $engineExe
 
-$composeExe = $null; $composePrefix = @()
-if ((& $engineExe compose version 2>&1 | Out-String) -match 'version' -and $LASTEXITCODE -eq 0) {
-    $composeExe = $engineExe; $composePrefix = @('compose')
-} elseif (Get-Command docker-compose -CommandType Application -ErrorAction SilentlyContinue) {
-    $composeExe = 'docker-compose'
-    if ($isPodman -and -not $env:DOCKER_HOST) {
-        $sock = (Invoke-Engine info --format '{{.Host.RemoteSocket.Path}}').Output
-        if ($sock) { $env:DOCKER_HOST = if ($sock -match '^\w+://') { $sock } else { "unix://$sock" } }
+$r = Invoke-Engine info --format json
+if ($r.ExitCode -ne 0) {
+    $hint = if ($engineName -eq 'podman') { "Start it with 'podman machine start'." } else {
+        $current = (Invoke-Engine context show).Output
+        $others = ((Invoke-Engine context ls --format '{{.Name}}').Output -split "`n" | Where-Object { $_ -and $_ -ne $current }) -join ', '
+        "The docker context is '$current'. Start that engine, or switch: 'docker context use <name>' (available: $others)."
     }
-} else {
-    throw "No compose command found. Install Docker Compose v2 ('docker compose' / 'docker-compose'); with podman, 'podman compose' needs docker-compose as its provider."
+    $err = ($r.Output -replace '(?s)^\s*\{.*\}\s*', '').Trim()    # docker prints an empty info JSON before the error
+    throw "The container engine is not reachable ($engineExe info failed). $hint`n$err"
 }
+$engineInfo = $r.Output | ConvertFrom-Json
+$isPodman = $null -ne $engineInfo.PSObject.Properties['host']     # podman's info JSON is lower-case nested
+$engineArch = if ($isPodman) { $engineInfo.host.arch } else { $engineInfo.Architecture }
+$engineDesc = if ($isPodman) { "podman $($engineInfo.version.Version)" } else { "$($engineInfo.OperatingSystem) $($engineInfo.ServerVersion)".Trim() }
+
+$r = Invoke-Engine compose version
+if ($r.ExitCode -ne 0) {
+    throw "'$engineName compose' does not work. Install Docker Compose v2$(if ($isPodman) { " (podman compose uses docker-compose as its provider)" }).`n$($r.Output)"
+}
+$composeExe = $engineExe; $composePrefix = @('compose')
 $ctx.ComposeExe = $composeExe; $ctx.ComposePrefix = $composePrefix
 
 $composeLabel = "label=com.docker.compose.project=$n"
@@ -347,11 +359,9 @@ if (-not $cfg.ArtifactUrl -and (-not $cfg.BcVersion -or $cfg.BcVersion -eq 'late
 # The bc-runner image is linux/amd64 only. On ARM hosts (Apple Silicon, ARM Linux/Windows)
 # it runs under emulation (Rosetta / qemu).
 $hostArch = "$([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
-$engineArch = if ($isPodman) { (Invoke-Engine info --format '{{.Host.Arch}}').Output } else { (Invoke-Engine info --format '{{.Architecture}}').Output }
 $emulated = $hostArch -match 'Arm' -or $engineArch -match 'arm|aarch'
-if ($isPodman -and $emulated -and -not $IsLinux) {
-    $rootful = (Invoke-Engine machine inspect --format '{{.Rootful}}').Output
-    if ($rootful -match 'false') { Write-Warning "The podman machine is rootless; MsDyn365Bc.On.Linux needs 'podman machine set --rootful' and Rosetta (see its MacOS.md)." }
+if ($isPodman -and $emulated -and -not $IsLinux -and $engineInfo.host.security.rootless) {
+    Write-Warning "The podman machine is rootless; MsDyn365Bc.On.Linux needs 'podman machine set --rootful' and Rosetta (see its MacOS.md)."
 }
 
 # ---------------------------------------------------------------------------
@@ -465,7 +475,7 @@ $ctx.ComposeFileArgs = @($composeFiles | ForEach-Object { '-f'; $_ }) + @('--env
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $versionText = if ($cfg.ArtifactUrl) { $cfg.ArtifactUrl } else { "$($cfg.BcType) $($cfg.BcVersion) ($($cfg.Country))" }
-Write-Step "Creating BC environment '$n': $versionText via $composeExe $($composePrefix -join ' ')$(if ($emulated) { ' (amd64 emulation)' })"
+Write-Step "Creating BC environment '$n': $versionText on $engineDesc$(if ($emulated) { ' (amd64 emulation)' })"
 Write-Note "Compose files: $(($composeFiles | ForEach-Object { Split-Path -Leaf $_ }) -join ' + ')  (state: $stateDir)"
 Write-Note "Ports: dev $($ports.DevPort), OData $($ports.ODataPort), API $($ports.ApiPort), mgmt $($ports.MgmtPort), client $($ports.ClientPort), SQL $($ports.SqlPort)$(if ($cfg.WebClient) { ", web $($ports.WebClientPort)" })"
 if ($licensePath) { Write-Note "License: $licensePath" }
@@ -477,13 +487,23 @@ $null = Assert-Ok (Invoke-Compose config --quiet) 'compose config'
 # Images and start
 # ---------------------------------------------------------------------------
 Write-Step 'Pulling images (compose pull)'
+# A broken credential helper ('credsStore' in ~/.docker/config.json, e.g. 'desktop' left behind
+# after uninstalling Docker Desktop, or a locked keychain) fails every pull, even of public images.
+$credHint = "The docker credential helper fails. The images are public: fix or remove 'credsStore' in ~/.docker/config.json (a 'desktop' entry left over from Docker Desktop causes this)."
 $r = Invoke-Compose pull --ignore-pull-failures
 if ($r.ExitCode -ne 0 -or $r.Output -match 'error|denied|failed') {
-    Write-Warning "Some images could not be pulled; locally cached images are used where present.`n$(($r.Output -split "`n" | Select-String -Pattern 'error|denied|failed' | Select-Object -First 3) -join "`n")"
+    $why = if ($r.Output -match 'credential') { " $credHint" } else { '' }
+    Write-Warning "Some images could not be pulled; images already present locally are used.$why`n$(($r.Output -split "`n" | Select-String -Pattern 'error|denied|failed' | Select-Object -First 3) -join "`n")"
 }
 
 Write-Step 'Starting containers (compose up -d)'
-$null = Assert-Ok (Invoke-Compose up -d) 'compose up'
+# --no-build: upstream's bc service has a build: section, so a failed pull would otherwise turn
+# into a slow local build of the runner image from source (and that build then shadows the
+# published image on every later run, because of pull_policy: missing).
+$r = Invoke-Compose up -d --no-build
+if ($r.ExitCode -ne 0) {
+    throw "compose up failed (rc=$($r.ExitCode)).$(if ($r.Output -match 'credential') { " $credHint" })`n$($r.Output)"
+}
 $bcContainer = Get-ServiceContainer bc
 if (-not $bcContainer) { throw 'compose up returned, but no bc container exists.' }
 
