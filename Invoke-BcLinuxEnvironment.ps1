@@ -239,12 +239,15 @@ $ctx.EngineExe = $engineExe
 
 $r = Invoke-Engine info --format json
 if ($r.ExitCode -ne 0) {
-    $hint = if ($engineName -eq 'podman') { "Start it with 'podman machine start'." } else {
+    $hint = if ($engineName -eq 'podman') { "Start it with 'podman machine start'." }
+    elseif ($env:DOCKER_HOST) { "DOCKER_HOST is set to '$env:DOCKER_HOST'; start that engine or unset DOCKER_HOST." }
+    else {
         $current = (Invoke-Engine context show).Output
         $others = ((Invoke-Engine context ls --format '{{.Name}}').Output -split "`n" | Where-Object { $_ -and $_ -ne $current }) -join ', '
         "The docker context is '$current'. Start that engine, or switch: 'docker context use <name>' (available: $others)."
     }
-    $err = ($r.Output -replace '(?s)^\s*\{.*\}\s*', '').Trim()    # docker prints an empty info JSON before the error
+    # docker prints an empty info JSON (and possibly warnings) around the real error.
+    $err = (($r.Output -replace '(?s)\{.*\}', '') -split "`n" | Where-Object { $_.Trim() -and $_ -notmatch '^\s*Warning:' }) -join "`n"
     throw "The container engine is not reachable ($engineExe info failed). $hint`n$err"
 }
 $engineInfo = $r.Output | ConvertFrom-Json
