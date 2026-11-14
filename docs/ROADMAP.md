@@ -1,6 +1,6 @@
 # Roadmap and findings
 
-Status as of 2026-11-14. Usage of what works today is in [README.md](../README.md).
+Status as of 2026-11-14 (configuration packages done). Usage of what works today is in [README.md](../README.md).
 
 ## Done
 
@@ -44,98 +44,60 @@ Status as of 2026-11-14. Usage of what works today is in [README.md](../README.m
 
 ---
 
-## In progress: configuration packages (optional final step)
+## Done: company and configuration packages (`-CompanyName`, `-ConfigPackages`)
 
-Goal: an optional last step for the script that creates a company, then imports and applies
-RapidStart configuration packages in a defined order (for example BC base data, then the
-demo data packages of an ISV solution).
+Validated 2026-11-14 on Kiri / Apple Silicon, BC 28.5 W1 + LS Central: new company, BC `EXTENDED`
+package (403 tables, 15,834 records: import 300 s, apply 335 s, the 4 known item-category errors),
+`SalesPrices` feature, then the LS Central and pharmacy demo packages in their documented order.
 
-### Mechanism: automation API v2.0
+**Mechanism:** automation API v2.0, called with curl inside the bc container:
+`automationCompanies` (create) → per package `configurationPackages` create →
+`PATCH file('{code}')/content` → `Microsoft.NAV.import` → poll `importStatus` → `Microsoft.NAV.apply`
+→ poll `applyStatus`/`numberOfErrors`; `features('{id}')/Microsoft.NAV.activate`
+(`updateInBackground: false` and `startDateTime` are both required).
 
-Everything is exposed under `http://localhost:7052/BC/api/microsoft/automation/v2.0/companies({id})/…`:
+What had to be solved on the Linux tier (upstream reports drafted, not filed yet):
 
-| Need | API | Status |
-|---|---|---|
-| Create company | `POST automationCompanies {"name","displayName"}` (`evaluationCompany` is read-only) | **Works** (about 33 s), once SQL Full-Text Search is available. |
-| Enable a feature (e.g. `SalesPrices`) | `features('SalesPrices')/Microsoft.NAV.activate` | Not tried yet; the data-update behaviour needs checking. |
-| Create package record | `POST configurationPackages {"code","packageName"}`, code read from the file header | Works. |
-| Upload file | `PATCH configurationPackages({id})/file('{code}')/content` (octet-stream, `If-Match: *`) | Works. |
-| Import | `POST configurationPackages({id})/Microsoft.NAV.import`, then poll `importStatus` | **Blocked** (see blocker 2). |
-| Apply | `POST …/Microsoft.NAV.apply`, then poll `applyStatus` / `numberOfErrors` | Not reached. |
+1. **SQL Full-Text Search.** Creating a company fails with *"Text optimized index cannot be
+   created/queried because the SQL Server Full-Text Search component is not installed"*. Upstream's
+   `mssql:2022-fts` is built on `2022-latest`, which crashes under Rosetta, so ARM hosts build CU17 +
+   `mssql-server-fts 16.0.4175.1-3` (engine build `16.0.4175.1`) from a Dockerfile embedded in the
+   script.
+2. **Background tasks never ran** (the old "stays Scheduled" blocker). Two causes:
+   - `TaskRunner.InternalRunAsync` → `NavPerformanceCounterSetter.NativeMethods.QueryPerformanceCounter`
+     is imported from **`Kernel32.dll`** (capital K; every other kernel32 import in `Nav.Ncl` is lower
+     case). Upstream's stub library has the function, but its resolver compares names
+     case-sensitively and links only `kernel32.dll` → `DllNotFoundException`; the task stays claimed
+     (`[$ndo$taskscheduling].state = 3`) forever. Fix: `/bc/service/Kernel32.dll` → `libwin32_stubs.so`.
+   - Upstream inserts the bootstrap user with a fixed **Windows Security ID**, so the task scheduler
+     refreshes the user's Windows groups via `System.DirectoryServices` (`kernel32!CompareString`,
+     not stubbed) → `EntryPointNotFoundException`, retried with back-off. Fix: clear the SID (a
+     NavUserPassword user has none) and restart the tier.
+3. **Parallel table import** (`Config. XML Exchange` → `Parallel Session Management` →
+   `Memory Mapped File.CreateOrOpen`) fails with *"Named maps are not supported"* on .NET/Linux. Every
+   table with ≥ `MinCountForAsyncImport` rows (package header attribute, default 5; the header
+   overrides the package record) goes that way. Fix: upload a copy with the attribute set to
+   `2147483647`, so tables import synchronously.
+4. **Slow requests through the engine's proxies.** Kiri's name router cut the ~30 s company creation
+   at 30 s (BC then cancels it), and Kiri's port forwarding drops connections idle for 300 s. All
+   package calls therefore run inside the bc container.
 
-The package code is read from the gzip / UTF-16 XML header of the `.rapidstart` file.
+Useful for diagnosis: `BC_DEBUG_FIRSTCHANCE=1` (upstream #44) shows exceptions BC normally redacts;
+the task scheduler logs as `Category: TaskScheduling`; scheduled tasks are in `[Scheduled Task]` and
+`[$ndo$taskscheduling]`.
 
-### Blocker 1: SQL Full-Text Search (resolved, not yet in the script)
+### Order used for the LS Central demo company
 
-Creating a company fails with *"Text optimized index cannot be created/queried because the
-SQL Server Full-Text Search component is not installed"*. Upstream's FTS image
-(`mssql:2022-fts`) is built on `2022-latest`, which crashes under Rosetta.
+BC `EXTENDED` → `feature:SalesPrices` → LS `NO-01`, `NO-02`, `NO-02A`, `NO-03` … `NO-11` (folder order
+works) → pharmacy `LSPH_0`, `LSPH_DEFAULT_DATA`, `LSPH_DISPENSE`, `LSPH_DEMO_DATA` (listed one by one).
+Vendor-specific notes are local only (`experiments/config-packages-notes.md`).
 
-Fix: build an FTS variant of **CU17**, with the FTS package pinned to the engine build:
+### Not done
 
-- Base image: `mcr.microsoft.com/mssql/server:2022-CU17-ubuntu-22.04`, platform
-  `linux/amd64`.
-- The engine version comes from the base image label `com.microsoft.version`
-  (`16.0.4175.1`). The matching package is `mssql-server-fts 16.0.4175.1-3`;
-  `sqlservr --version` does not work at build time.
-- Verified: `SERVERPROPERTY('IsFullTextInstalled') = 1`, and company creation then works.
-- Use it with `-SqlImage`. The script does not build it yet (see planned design).
-
-### Blocker 2: package import never runs (open)
-
-`Microsoft.NAV.import` queues a background task, and `importStatus` stays at `Scheduled`
-indefinitely (20+ min, no SQL activity, BC CPU around 10–15%).
-
-- `[$ndo$taskscheduling]` shows the task claimed by the live server instance but never
-  executing. A task queued on first boot never ran either, so the task scheduler may not
-  execute background tasks at all on this Linux/emulated service tier.
-- `EnableTaskScheduler=true` and `TaskSchedulerMaximumConcurrentRunningTasks=5` in
-  `/bc/service/CustomSettings.config`. Upstream documents nothing about background tasks or
-  the job queue.
-- **Possibly confounded:** the SQL container was swapped under the running tier during the
-  test, causing connection-lost errors in `NavTaskScheduler.RefreshTaskScheduleListAsync`.
-  A clean restart to rule this out was not finished.
-
-Next steps, in order:
-1. Recreate an environment with the FTS image from the start, then check whether a queued
-   import runs.
-2. If tasks still never run, test the task scheduler in isolation (any `TaskScheduler.CreateTask`
-   scenario, e.g. a job queue entry). Read the NST log for the session start of the task.
-   Check whether upstream has an issue for it, and report one if not.
-3. If background tasks can't be made to work, ways to import/apply synchronously:
-   - drive the *Configuration Packages* page through the client-services WebSocket
-     (upstream already has a TestPage-capable runner in the image)
-   - a small helper extension exposing an unbound API action that runs
-     `Config. Package - Import`/`Config. Package Management` synchronously
-
-   The extension needs the AL compiler (upstream documents the Linux AL tool).
-
-### Planned script design (once the blockers are solved)
-
-The optional final step, run after the extensions:
-
-- `-CompanyName 'My Demo'`: create the company if it doesn't exist.
-- `-ConfigPackages <ordered list>`: files and/or folders. Folders are sorted naturally, so
-  `NO-02` < `NO-02A` < `NO-03`. Env file key `CONFIG_PACKAGES` (`;`-separated).
-- `-EnableFeatures SalesPrices`, applied at a defined point. An inline step token in the
-  list, e.g. `feature:SalesPrices`, would keep the order explicit in one place.
-- `-MaxPackageErrors` / `-AllowedPackageErrors`: per-package tolerance (some base packages
-  have known errors). Report `numberOfErrors` per package, and stop or continue as configured.
-- **SQL Full-Text Search:**
-  - x86 hosts: upstream `mssql:2022-fts` via `-SqlImage`.
-  - ARM hosts: build a CU17 FTS image from a Dockerfile embedded in the script on first use
-    (engine version from the image label).
-
-  Turn it on automatically when a company will be created, or with an explicit
-  `-FullTextSearch` switch.
-
-Example env file additions:
-
-```ini
-FULL_TEXT_SEARCH=1
-COMPANY_NAME=My Demo
-CONFIG_PACKAGES=packages/NAV28.0.W1.ENU.EXTENDED.rapidstart;feature:SalesPrices;packages/demo-data
-```
+- **Retail images** (`Retail Image List → Import from Zip`, `Update Image Links`): UI actions, no API.
+- **Per-package error thresholds** (`-MaxPackageErrors`): apply errors are only reported.
+- **Faster import**: the synchronous path imports tables one at a time; an emulation of named
+  memory-mapped files in the image would allow BC's parallel import again.
 
 ---
 

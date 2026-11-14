@@ -271,7 +271,10 @@ Relative paths in an env file (apps, license) are resolved against the env file'
 | `-RepoPath` | `REPO_PATH` | `~/.bcvm/MsDyn365Bc.On.Linux` | Use your own clone of the upstream repo. |
 | `-RepoRef` | `REPO_REF` | `master` | Branch or tag to fetch when no `-RepoPath` is given. |
 | `-BcImage` | `BC_RUNNER_IMAGE` | upstream `bc-runner:latest` | Override the BC image. |
-| `-SqlImage` | `BC_SQL_IMAGE` | upstream default | Override the SQL Server image (e.g. one with Full-Text Search, see [docs/ROADMAP.md](docs/ROADMAP.md)). |
+| `-SqlImage` | `BC_SQL_IMAGE` | upstream default | Override the SQL Server image. |
+| `-CompanyName` | `COMPANY_NAME` | – | Company for `-ConfigPackages`; created if it doesn't exist. Turns on `-FullTextSearch`. See [Company and configuration packages](#company-and-configuration-packages). |
+| `-ConfigPackages` | `CONFIG_PACKAGES` | – | RapidStart packages imported and applied into `-CompanyName` in order: `.rapidstart` files, folders (sorted by name) and `feature:<Id>` steps, one string separated by `;` (or a PowerShell array). |
+| `-FullTextSearch` | `FULL_TEXT_SEARCH` (`1`/`0`) | on with `-CompanyName`, else off | SQL Server with Full-Text Search (needed to create a company, and by apps using `OptimizeForTextSearch`). ARM hosts build a CU17-based image once (`bclinuxenvironment/mssql:2022-cu17-fts`, ~1 min); x86 hosts use upstream's `mssql:2022-fts`. Ignored when `-SqlImage` is set. |
 | `-SqlMemoryMB` | `MSSQL_MEMORY_LIMIT_MB` | `3072` | SQL Server memory cap. |
 | `-PersistDatabase` | `PERSIST_DATABASE` | on | Keep the database in a volume. `-PersistDatabase:$false` uses upstream's in-memory tmpfs database, which is lost when the SQL container stops. |
 | `-TimeoutMinutes` | `TIMEOUT_MINUTES` | `45` | Maximum wait for the service tier. |
@@ -373,6 +376,53 @@ Large apps take a while under emulation: a large ISV app (LS Central 28.2) took 
 
 ---
 
+## Company and configuration packages
+
+After the extensions, the script can create a company and fill it from RapidStart configuration
+packages, for example BC's base data followed by an ISV's demo data:
+
+```powershell
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -BcVersion 28.5 -LicenseFile ./dev.bclicense `
+    -Apps './apps' -CompanyName 'My Demo' `
+    -ConfigPackages './packages/NAV28.0.W1.ENU.EXTENDED.rapidstart;feature:SalesPrices;./packages/isv-demo-data'
+```
+
+```ini
+# the same in an env file
+COMPANY_NAME=My Demo
+CONFIG_PACKAGES=packages/NAV28.0.W1.ENU.EXTENDED.rapidstart;feature:SalesPrices;packages/isv-demo-data
+```
+
+- **Order** is the order given. A folder contributes its `*.rapidstart` files sorted by name
+  (`NO-02` < `NO-02A` < `NO-03`); list files one by one when their names don't sort into the needed
+  order.
+- **`feature:<Id>`** enables a Feature Management feature at that point, with its data update, for
+  example `feature:SalesPrices` ("New sales pricing experience") before packages that load price lists.
+- **Each package** is imported and then applied through the automation API. An existing package with
+  the same code in that company is replaced. Record errors from the apply step (e.g. the 4 known
+  item-category errors of BC's `EXTENDED` package) are reported as warnings and listed in BC under
+  *Configuration Packages*; an import or apply that fails as a whole stops the script.
+- **Company creation needs SQL Full-Text Search**, so `-CompanyName` turns on `-FullTextSearch`. On
+  ARM the first run builds the SQL image (about a minute); later runs reuse it.
+- **Packages are big:** BC's `EXTENDED` package (403 tables, ~16,000 records) took about 5 min to import
+  and 5–6 min to apply under emulation.
+
+Things the script does so that packages work on the Linux service tier (details in
+[docs/ROADMAP.md](docs/ROADMAP.md)):
+
+- It enables **background tasks**, which package import and apply (and the job queue) run on: a
+  `Kernel32.dll` link for the task runner, and no Windows Security ID on the login user. The first
+  run with packages restarts the service tier once for the latter.
+- It uploads a copy of each package with **`MinCountForAsyncImport`** raised, because BC's parallel
+  table import uses named memory-mapped files, which .NET doesn't support on Linux. Tables are then
+  imported one after another.
+- All API calls run **inside the BC container**, so slow calls aren't cut off by the engine's port
+  forwarding or name router.
+
+Retail images and other UI-only steps are not covered.
+
+---
+
 ## What the script does
 
 1. **Settings:** merges defaults, env file, `BCVM_*` variables and parameters.
@@ -410,8 +460,13 @@ Large apps take a while under emulation: a large ISV app (LS Central 28.2) took 
 8. **Wait:** polls until the container's `/tmp/bc-ready` marker exists **and** OData
    `/Company` answers with the configured login. It prints upstream's boot progress lines
    and fails fast, showing the last 60 log lines, if the container stops.
-9. **Extensions:** see above.
-10. **Summary:** endpoints, login, installed extensions, and the full compose command for
+9. **Background tasks:** links `Kernel32.dll` for the task runner and clears the login user's
+   Windows Security ID, so the task scheduler can run tasks (see
+   [Company and configuration packages](#company-and-configuration-packages)).
+10. **Extensions:** see above.
+11. **Company and packages** (optional): creates `-CompanyName` and imports and applies
+    `-ConfigPackages` in order.
+12. **Summary:** endpoints, login, installed extensions, company, and the full compose command for
     managing the stack.
 
 On first boot the container downloads the BC artifacts (about 2 GB), restores the demo
@@ -454,7 +509,7 @@ docker compose -p bc285 \
 | `Host port N is already in use` | Use `-PortOffset` or the individual port parameters. |
 | BC container exits with code 133 and `rosetta error` in the logs | Emulation without the .NET fixes. They are applied automatically on ARM; if you override `-ContainerEnv`, keep `DOTNET_INTERNAL_ThreadSuspendInjection=0`. |
 | ISV apps fail to publish with license / object-range errors | Pass the partner license with `-LicenseFile` / `BC_LICENSE_HOST_PATH`. |
-| `Text optimized index cannot be created … Full-Text Search component is not installed` | An app (or creating a new company) needs SQL Full-Text Search. Use an FTS-capable SQL image via `-SqlImage`; see [docs/ROADMAP.md](docs/ROADMAP.md) for the ARM build. |
+| `Text optimized index cannot be created … Full-Text Search component is not installed` | An app (or creating a new company) needs SQL Full-Text Search: add `-FullTextSearch` (recreate the environment, the SQL image changes). |
 | Timeout waiting for BC | `docker logs <Name>-bc-1`. A first boot under emulation takes 3–5 min; slow artifact downloads add to that. |
 
 ---

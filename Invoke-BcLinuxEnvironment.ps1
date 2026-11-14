@@ -73,6 +73,17 @@ param(
     # Optional .bclicense file (e.g. a partner developer license) imported before the service
     # tier starts, instead of the CRONUS demo license. Needed for ISV apps such as LS Central.
     [Alias('BcLicenseHostPath')] [string] $LicenseFile,
+    # Company to create (if missing) for -ConfigPackages. Creating a company needs SQL Full-Text
+    # Search, so -FullTextSearch is turned on automatically when this is set.
+    [string] $CompanyName,
+    # RapidStart configuration packages imported and applied into -CompanyName, in order: one ';'
+    # separated string or an array of .rapidstart files, folders (their *.rapidstart sorted by name)
+    # and 'feature:<Id>' steps that enable a Feature Management feature at that point
+    # (e.g. 'base.rapidstart;feature:SalesPrices;./ls-packages').
+    [string[]] $ConfigPackages,
+    # SQL Server with Full-Text Search (needed to create companies and by apps that use
+    # OptimizeForTextSearch). ARM hosts build a CU17-based image once; x86 uses upstream's 2022-fts.
+    [switch] $FullTextSearch,
     # Additional environment variables for the BC container.
     [hashtable] $ContainerEnv,
     # KEY=VALUE file with settings (see the .DESCRIPTION).
@@ -142,6 +153,9 @@ $defaults = [ordered]@{
     PersistDatabase       = $true
     TimeoutMinutes        = 45
     PublishTimeoutSeconds = 3600
+    CompanyName           = ''
+    ConfigPackages        = @()
+    FullTextSearch        = $null     # auto: on when CompanyName is set
 }
 # KEY names accepted in the env file / as BCVM_<KEY> environment variables.
 $keyMap = @{
@@ -155,6 +169,7 @@ $keyMap = @{
     BC_RUNNER_IMAGE = 'BcImage'; BC_SQL_IMAGE = 'SqlImage'; MSSQL_MEMORY_LIMIT_MB = 'SqlMemoryMB'
     PERSIST_DATABASE = 'PersistDatabase'; TIMEOUT_MINUTES = 'TimeoutMinutes'
     PUBLISH_TIMEOUT_SECONDS = 'PublishTimeoutSeconds'
+    COMPANY_NAME = 'CompanyName'; CONFIG_PACKAGES = 'ConfigPackages'; FULL_TEXT_SEARCH = 'FullTextSearch'
 }
 $cfg = [ordered]@{}
 foreach ($k in $defaults.Keys) { $cfg[$k] = $defaults[$k] }
@@ -162,8 +177,8 @@ $passThroughEnv = [ordered]@{}
 
 function ConvertTo-Setting([string] $Key, [string] $Value) {
     switch ($Key) {
-        { $_ -in 'WebClient', 'PersistDatabase', 'PublishPorts' } { return $Value -match '^(1|true|yes|on)$' }
-        'Apps' { return @($Value -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+        { $_ -in 'WebClient', 'PersistDatabase', 'PublishPorts', 'FullTextSearch' } { return $Value -match '^(1|true|yes|on)$' }
+        { $_ -in 'Apps', 'ConfigPackages' } { return @($Value -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
         { $_ -in 'PortOffset', 'DevPort', 'ODataPort', 'ApiPort', 'MgmtPort', 'ClientPort', 'WebClientPort', 'SqlPort', 'SqlMemoryMB', 'TimeoutMinutes', 'PublishTimeoutSeconds' } { return [int] $Value }
         default { return $Value }
     }
@@ -328,7 +343,9 @@ $appFiles = [Collections.Generic.List[string]]::new()
 # `pwsh -File` (how bash/zsh/cmd run the script) passes `-Apps 'a.app','b.app'` as ONE string
 # "a.app,b.app". Split such an entry on ',' / ';' unless it exists as a path itself.
 $appEntries = foreach ($a in @($cfg.Apps)) {
-    if ($a -match '[,;]' -and -not (Test-Path -LiteralPath (Resolve-HostPath $a))) {
+    # .NET Exists, not Test-Path: Test-Path throws PathTooLongException on a long list.
+    $p = Resolve-HostPath $a
+    if ($a -match '[,;]' -and -not ([IO.File]::Exists($p) -or [IO.Directory]::Exists($p))) {
         $a -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
     } else { $a }
 }
@@ -344,6 +361,27 @@ if ($cfg.LicenseFile) {
     $licensePath = Resolve-HostPath $cfg.LicenseFile
     if (-not (Test-Path -LiteralPath $licensePath -PathType Leaf)) { throw "License file not found: $($cfg.LicenseFile)" }
 }
+
+# Configuration packages: files, folders (*.rapidstart, ordinal name order: NO-02 < NO-02A < NO-03)
+# and 'feature:<Id>' steps. Same one-string splitting as -Apps.
+$packageSteps = [Collections.Generic.List[object]]::new()
+foreach ($c in @($cfg.ConfigPackages)) {
+    $parts = if ($c -match '[,;]' -and -not ([IO.File]::Exists((Resolve-HostPath $c)) -or [IO.Directory]::Exists((Resolve-HostPath $c)))) {
+        $c -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ } } else { @($c) }
+    foreach ($e in $parts) {
+        if ($e -match '^feature:(\S+)$') { $packageSteps.Add([pscustomobject]@{ Feature = $Matches[1]; Path = $null }); continue }
+        $full = Resolve-HostPath $e
+        if ([IO.Directory]::Exists($full)) {
+            $files = [IO.Directory]::GetFiles($full, '*.rapidstart')
+            [Array]::Sort($files, [StringComparer]::OrdinalIgnoreCase)
+            foreach ($f in $files) { $packageSteps.Add([pscustomobject]@{ Feature = $null; Path = $f }) }
+        } elseif ([IO.File]::Exists($full)) { $packageSteps.Add([pscustomobject]@{ Feature = $null; Path = $full }) }
+        else { throw "Configuration package file or folder not found: $e" }
+    }
+}
+if ($packageSteps.Count -and -not $cfg.CompanyName) { throw '-ConfigPackages needs -CompanyName (the company to import into; it is created if missing).' }
+# Creating a company needs SQL Full-Text Search ("Text optimized index cannot be created").
+if ($null -eq $cfg.FullTextSearch) { $cfg.FullTextSearch = [bool] $cfg.CompanyName }
 
 # Containers OR volumes count: after a plain `compose down` the volumes (database, installed
 # apps) are still there, and a new `up` would silently reuse them.
@@ -388,6 +426,38 @@ $hostArch = "$([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
 $emulated = $hostArch -match 'Arm' -or $engineArch -match 'arm|aarch'
 if ($isPodman -and $emulated -and -not $IsLinux -and $engineInfo.host.security.rootless) {
     Write-Warning "The podman machine is rootless; MsDyn365Bc.On.Linux needs 'podman machine set --rootful' and Rosetta (see its MacOS.md)."
+}
+
+# SQL Server with Full-Text Search. Upstream's 2022-fts image is built on 2022-latest, which crashes
+# under Rosetta (CU18+), so ARM hosts get the FTS package added to CU17, built once from this recipe.
+if ($cfg.FullTextSearch -and -not $cfg.SqlImage) {
+    if ($emulated) {
+        $cfg.SqlImage = 'bclinuxenvironment/mssql:2022-cu17-fts'
+        if ((Invoke-Engine image inspect $cfg.SqlImage).ExitCode -ne 0) {
+            Write-Step "Building $($cfg.SqlImage): SQL Server 2022 CU17 + Full-Text Search (once, ~2 min)"
+            $dockerfile = @'
+FROM mcr.microsoft.com/mssql/server:2022-CU17-ubuntu-22.04
+# CU17 engine build; the FTS package must match it exactly.
+ARG ENGINE=16.0.4175.1
+USER root
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl gnupg ca-certificates; \
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg; \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/mssql-server-2022 jammy main" > /etc/apt/sources.list.d/mssql-server-2022.list; \
+    apt-get update; \
+    VER=$(apt-cache madison mssql-server-fts | awk -v e="$ENGINE" '$3 ~ "^"e"-" {print $3; exit}'); \
+    test -n "$VER"; \
+    cd /tmp; apt-get download "mssql-server-fts=$VER"; dpkg-deb -x mssql-server-fts_*.deb /; rm -f mssql-server-fts_*.deb; \
+    rm -rf /var/lib/apt/lists/*
+USER mssql
+'@
+            $out = $dockerfile.Replace("`r`n", "`n") | & $ctx.EngineExe build --platform linux/amd64 -t $cfg.SqlImage - 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "Building $($cfg.SqlImage) failed:`n$(($out | Select-Object -Last 15) -join "`n")" }
+        }
+    } else {
+        $cfg.SqlImage = 'ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022-fts'
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -597,11 +667,11 @@ function Invoke-BcGet([int] $ContainerPort, [string] $Path) {
     if ($r.ExitCode -eq 0 -and $r.Output) { try { $r.Output | ConvertFrom-Json } catch { $null } }
 }
 
-Write-Step "Waiting for the service tier (first boot downloads ~2 GB of artifacts; up to $($cfg.TimeoutMinutes) min)"
-$deadline = (Get-Date).AddMinutes($cfg.TimeoutMinutes)
-$lastLine = ''
-$resp = $null
-while ($true) {
+function Wait-BcReady {
+  $deadline = (Get-Date).AddMinutes($cfg.TimeoutMinutes)
+  $lastLine = ''
+  $resp = $null
+  while ($true) {
     $state = (Invoke-Engine inspect -f '{{.State.Status}}' $bcContainer).Output
     if ($state -notin 'running', 'created', 'restarting') {
         $logs = (Invoke-Engine logs --tail 60 $bcContainer).Output
@@ -615,9 +685,37 @@ while ($true) {
     if ($line -and $line -ne $lastLine -and $line -match '^\[(entrypoint|artifacts)\]') { Write-Note $line; $lastLine = $line }
     if ((Get-Date) -gt $deadline) { throw "Timed out after $($cfg.TimeoutMinutes) min waiting for BC. Check: $engineExe logs $bcContainer" }
     Start-Sleep -Seconds 5
+  }
+  @($resp.value | ForEach-Object Name)
 }
-$companies = @($resp.value | ForEach-Object Name)
+Write-Step "Waiting for the service tier (first boot downloads ~2 GB of artifacts; up to $($cfg.TimeoutMinutes) min)"
+$companies = Wait-BcReady
 Write-Step "Service tier ready after $([int]$sw.Elapsed.TotalMinutes) min. Companies: $($companies -join ', ')"
+
+# ---------------------------------------------------------------------------
+# Background tasks (task scheduler, job queue, configuration package import/apply)
+# ---------------------------------------------------------------------------
+# Two gaps in the Linux tier stop every background task (see docs/ROADMAP.md):
+# 1. TaskRunner P/Invokes QueryPerformanceCounter from 'Kernel32.dll' (capital K). Upstream links only
+#    'kernel32.dll' to its Win32 stubs, and Linux file names are case-sensitive -> DllNotFoundException.
+#    The link lives in the persistent service volume.
+# 2. The bootstrap user carries a Windows Security ID, so the task scheduler refreshes its Windows
+#    groups through System.DirectoryServices (kernel32 CompareString, not stubbed). A NavUserPassword
+#    user needs no SID; clearing it skips that path. Takes effect when the tier restarts.
+$null = Invoke-Engine exec $bcContainer sh -c 'test -f /bc/hook/libwin32_stubs.so && ln -sf /bc/hook/libwin32_stubs.so /bc/service/Kernel32.dll'
+$sqlContainer = Get-ServiceContainer sql
+$database = if ($passThroughEnv.Contains('BC_DATABASE')) { $passThroughEnv['BC_DATABASE'] } else { 'CRONUS' }
+function Invoke-Sql([string] $Query) {
+    Invoke-Engine exec $sqlContainer /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $cfg.SaPassword -C -b -h -1 -W -d $database -Q "SET NOCOUNT ON; $Query"
+}
+$r = Invoke-Sql ("UPDATE [User] SET [Windows Security ID] = '' WHERE [User Name] = N'{0}' AND [Windows Security ID] <> ''; SELECT @@ROWCOUNT" -f $cfg.Username.Replace("'", "''"))
+if ($r.ExitCode -ne 0) { Write-Warning "Could not clear the Windows Security ID of $($cfg.Username); background tasks may not run.`n$($r.Output)" }
+elseif ("$($r.Output)".Trim() -ne '0' -and ($packageSteps.Count -or $cfg.CompanyName)) {
+    # The user is cached by the running tier; restart it so the package import tasks can run now.
+    Write-Step 'Restarting the service tier so background tasks can run'
+    $null = Assert-Ok (Invoke-Engine restart $bcContainer) 'restarting the bc container'
+    $companies = Wait-BcReady
+}
 
 # ---------------------------------------------------------------------------
 # Extensions
@@ -704,6 +802,130 @@ if ($appFiles.Count) {
 }
 
 # ---------------------------------------------------------------------------
+# Company and configuration packages
+# ---------------------------------------------------------------------------
+# Automation API v2.0, called with curl INSIDE the bc container like the publish: creating a company
+# takes ~30 s and package steps minutes, longer than some engines' proxies keep a request open.
+# Bodies and files are copied in (no JSON on the command line, so no native-argument quoting issues).
+$automation = '/BC/api/microsoft/automation/v2.0'
+function Copy-ToBc([string] $LocalPath) {
+    $remote = "$publishDir/$([guid]::NewGuid().ToString('N'))$([IO.Path]::GetExtension($LocalPath))"
+    $null = Assert-Ok (Invoke-Engine cp $LocalPath "$($bcContainer):$remote") "copying $(Split-Path -Leaf $LocalPath) into $bcContainer"
+    $remote
+}
+function Invoke-BcApi([string] $Method, [string] $Path, $Body, [string] $InFile, [int] $TimeoutSec = 600) {
+    $curl = @('exec', $bcContainer, 'curl', '-s', '--max-time', "$TimeoutSec", '-u', $pair, '-X', $Method, '-w', '\n%{http_code}')
+    $remote = $null; $tmp = $null
+    if ($null -ne $Body) {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) "bcvm-$([guid]::NewGuid().ToString('N')).json"
+        Set-Content -LiteralPath $tmp -Value ($Body | ConvertTo-Json -Depth 5 -Compress) -NoNewline -Encoding utf8NoBOM
+        $InFile = $tmp; $type = 'application/json'
+    } else { $type = 'application/octet-stream' }
+    try {
+        if ($InFile) { $remote = Copy-ToBc $InFile; $curl += @('-H', "Content-Type: $type", '--data-binary', "@$remote") }
+        if ($Method -in 'PATCH', 'DELETE') { $curl += @('-H', 'If-Match: *') }
+        $r = Invoke-Engine @curl "http://localhost:7052$Path"
+    } finally {
+        if ($tmp) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+        if ($remote) { $null = Invoke-Engine exec $bcContainer rm -f $remote }
+    }
+    $lines = "$($r.Output)" -split "`n"
+    $code = [int]($lines[-1] -replace '\D', '0')
+    $raw = ($lines | Select-Object -SkipLast 1) -join "`n"
+    $json = if ($raw.Trim()) { try { $raw | ConvertFrom-Json } catch { $null } }
+    [pscustomobject]@{ Code = $code; Raw = $raw; Json = $json }
+}
+function Get-RapidStartHeader([string] $Path) {
+    $fs = [IO.File]::OpenRead($Path)
+    try {
+        $xr = [Xml.XmlReader]::Create([IO.Compression.GZipStream]::new($fs, [IO.Compression.CompressionMode]::Decompress))
+        $null = $xr.MoveToContent()
+        [pscustomobject]@{ Code = $xr.GetAttribute('Code'); Name = $xr.GetAttribute('PackageName') }
+    } finally { $fs.Dispose() }
+}
+# BC imports every table with >= MinCountForAsyncImport rows (package header, default 5) in parallel
+# sessions that exchange data through NAMED memory-mapped files, which .NET does not support on
+# Linux ("Named maps are not supported"). Upload a copy whose header keeps every table synchronous.
+function New-SyncImportCopy([string] $Path) {
+    $raw = [IO.MemoryStream]::new()
+    $in = [IO.File]::OpenRead($Path)
+    try { [IO.Compression.GZipStream]::new($in, [IO.Compression.CompressionMode]::Decompress).CopyTo($raw) } finally { $in.Dispose() }
+    $raw.Position = 0
+    $reader = [IO.StreamReader]::new($raw, [Text.Encoding]::UTF8, $true)    # BOM decides (packages are UTF-16)
+    $xml = $reader.ReadToEnd(); $enc = $reader.CurrentEncoding
+    $rx = [regex]'MinCountForAsyncImport="\d+"'
+    $xml = if ($rx.IsMatch($xml)) { $rx.Replace($xml, 'MinCountForAsyncImport="2147483647"', 1) }
+           else { ([regex]'<DataList ').Replace($xml, '<DataList MinCountForAsyncImport="2147483647" ', 1) }
+    $out = Join-Path ([IO.Path]::GetTempPath()) "bcvm-$([guid]::NewGuid().ToString('N')).rapidstart"
+    $fs = [IO.File]::Create($out)
+    try {
+        $gz = [IO.Compression.GZipStream]::new($fs, [IO.Compression.CompressionLevel]::Optimal)
+        $bytes = $enc.GetPreamble() + $enc.GetBytes($xml); $gz.Write($bytes, 0, $bytes.Length); $gz.Dispose()
+    } finally { $fs.Dispose() }
+    $out
+}
+function Wait-PackageStatus([string] $CompanyPath, [string] $Id, [string] $Field) {
+    $deadline = (Get-Date).AddSeconds($cfg.PublishTimeoutSeconds)
+    while ($true) {
+        Start-Sleep -Seconds 5
+        $p = (Invoke-BcApi GET "$CompanyPath/configurationPackages($Id)").Json
+        if ($p -and $p.$Field -in 'Completed', 'Error') { return $p }
+        if ((Get-Date) -gt $deadline) { throw "Configuration package: $Field still '$($p.$Field)' after $($cfg.PublishTimeoutSeconds)s (-PublishTimeoutSeconds)." }
+    }
+}
+
+$packageSummary = $null
+if ($cfg.CompanyName) {
+    $null = Invoke-Engine exec $bcContainer mkdir -p $publishDir
+    $all = @((Invoke-BcApi GET "$automation/companies").Json.value)
+    $company = $all | Where-Object name -eq $cfg.CompanyName
+    if (-not $company) {
+        Write-Step "Creating company '$($cfg.CompanyName)'"
+        $t = [Diagnostics.Stopwatch]::StartNew()
+        $r = Invoke-BcApi POST "$automation/companies($($all[0].id))/automationCompanies" @{ name = $cfg.CompanyName; displayName = $cfg.CompanyName } -TimeoutSec 1800
+        if ($r.Code -notin 200, 201) { throw "Creating company '$($cfg.CompanyName)' failed (HTTP $($r.Code)):`n$($r.Raw)" }
+        $company = @((Invoke-BcApi GET "$automation/companies").Json.value) | Where-Object name -eq $cfg.CompanyName
+        Write-Note "created in $([int]$t.Elapsed.TotalSeconds)s"
+    }
+    $cu = "$automation/companies($($company.id))"
+    if ($packageSteps.Count) { Write-Step "Configuration packages: $($packageSteps.Count) step(s) into '$($cfg.CompanyName)'" }
+    $totalErrors = 0
+    foreach ($step in $packageSteps) {
+        $t = [Diagnostics.Stopwatch]::StartNew()
+        if ($step.Feature) {
+            $r = Invoke-BcApi POST "$cu/features('$($step.Feature)')/Microsoft.NAV.activate" @{ updateInBackground = $false; startDateTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } -TimeoutSec 3600
+            if ($r.Code -notin 200, 204) { throw "Enabling feature '$($step.Feature)' failed (HTTP $($r.Code)):`n$($r.Raw)" }
+            Write-Note "feature $($step.Feature): enabled in $([int]$t.Elapsed.TotalSeconds)s"
+            continue
+        }
+        $hdr = Get-RapidStartHeader $step.Path
+        $label = "$($hdr.Code) ($(Split-Path -Leaf $step.Path))"
+        $filter = [Uri]::EscapeDataString("code eq '$($hdr.Code.Replace("'", "''"))'")
+        foreach ($old in @((Invoke-BcApi GET "$cu/configurationPackages?`$filter=$filter").Json.value)) {
+            $null = Invoke-BcApi DELETE "$cu/configurationPackages($($old.id))"
+        }
+        $r = Invoke-BcApi POST "$cu/configurationPackages" @{ code = $hdr.Code; packageName = $hdr.Name }
+        if ($r.Code -notin 200, 201) { throw "Creating package $label failed (HTTP $($r.Code)):`n$($r.Raw)" }
+        $id = $r.Json.id
+        $copy = New-SyncImportCopy $step.Path
+        try { $r = Invoke-BcApi PATCH "$cu/configurationPackages($id)/file('$([Uri]::EscapeDataString($hdr.Code))')/content" -InFile $copy -TimeoutSec 1800 }
+        finally { Remove-Item -LiteralPath $copy -ErrorAction SilentlyContinue }
+        if ($r.Code -notin 200, 204) { throw "Uploading package $label failed (HTTP $($r.Code)):`n$($r.Raw)" }
+        $null = Invoke-BcApi POST "$cu/configurationPackages($id)/Microsoft.NAV.import"
+        $p = Wait-PackageStatus $cu $id 'importStatus'
+        if ($p.importStatus -eq 'Error') { throw "Importing package $label failed: $($p.importError)" }
+        $imported = [int]$t.Elapsed.TotalSeconds; $records = $p.numberOfRecords
+        $null = Invoke-BcApi POST "$cu/configurationPackages($id)/Microsoft.NAV.apply"
+        $p = Wait-PackageStatus $cu $id 'applyStatus'
+        if ($p.applyStatus -eq 'Error') { throw "Applying package $label failed: $($p.applyError)" }
+        $totalErrors += [int]$p.numberOfErrors
+        $msg = "$label`: $($p.numberOfTables) tables, $records records, import $($imported)s, apply $([int]$t.Elapsed.TotalSeconds - $imported)s"
+        if ($p.numberOfErrors) { Write-Warning "$msg, $($p.numberOfErrors) record error(s) (see Configuration Packages in BC)" } else { Write-Note "$msg, no errors" }
+    }
+    $packageSummary = if ($packageSteps.Count) { "$($packageSteps.Count) step(s), $totalErrors record error(s)" } else { $null }
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 Write-Step "Environment '$n' is ready ($([int]$sw.Elapsed.TotalMinutes) min)"
@@ -726,6 +948,7 @@ $summary = [ordered]@{
     Client     = Get-Endpoint ClientPort '/BC' 'ws'
     Sql        = $(if ('SqlPort' -in $publishedPorts) { "localhost,$($ports.SqlPort) (sa)" } else { '(not published; -SqlPort <port> publishes it)' })
     Username   = $cfg.Username
+    Company    = $(if ($cfg.CompanyName) { "$($cfg.CompanyName)$(if ($packageSummary) { "  (packages: $packageSummary)" })" } else { $null })
     Extensions = ($installed -join ', ')
     Compose    = "$composeHint <logs|stop|start|ps>"
     Remove     = "./Invoke-BcLinuxEnvironment.ps1 -Name $n -Remove"
@@ -736,4 +959,4 @@ if ($hostNames.Count) {
     $summary['Compose'] = "$composeHint <logs|stop|start|ps>"
     $summary['Remove'] = "./Invoke-BcLinuxEnvironment.ps1 -Name $n -Remove"
 }
-$summary.GetEnumerator() | ForEach-Object { Write-Host ('  {0,-11} {1}' -f $_.Key, $_.Value) }
+$summary.GetEnumerator() | Where-Object { $null -ne $_.Value } | ForEach-Object { Write-Host ('  {0,-11} {1}' -f $_.Key, $_.Value) }

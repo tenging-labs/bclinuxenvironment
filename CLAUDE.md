@@ -139,23 +139,23 @@ Cross-cutting rules:
 - **First boot and big publishes are slow under emulation:** boot ~3 min, a large ISV app
   publish 220–300 s. Run long commands in the background and poll for the result.
 
-## Work in progress: configuration packages
+## Company and configuration packages (`-CompanyName`, `-ConfigPackages`)
 
-Read `docs/ROADMAP.md` first. Summary:
+Working; details and root causes in `docs/ROADMAP.md`. Things that must stay in place:
 
-- **Order:** BC base package (e.g. `EXTENDED`) → enable feature `SalesPrices` → ISV demo-data
-  packages in their documented order. Vendor-specific package notes are local only
-  (`experiments/config-packages-notes.md`, git-ignored).
-- **Mechanism:** automation API v2.0:
-  - `automationCompanies` (create)
-  - `configurationPackages` (create → `PATCH file('{code}')/content` → `Microsoft.NAV.import` /
-    `apply`)
-  - `features(...)/Microsoft.NAV.activate`
-- **Company creation needs SQL Full-Text Search.** On ARM use a CU17-based FTS image (recipe in the
-  roadmap; a local build may exist in git-ignored `experiments/mssql-fts/`); upstream's `2022-fts` is
-  built on `2022-latest`, which crashes under Rosetta.
-- **Open blocker:** the import is queued as a background task and stays `Scheduled`; background
-  tasks have not been seen running on this tier. Unresolved; next steps are in the roadmap.
+- **Background tasks** need both fixes the script applies after readiness: the
+  `/bc/service/Kernel32.dll` link (task runner's `QueryPerformanceCounter`), and an empty
+  `[User].[Windows Security ID]` for the login user (else the task scheduler calls AD natives), which
+  needs a tier restart the first time. Symptom of a regression: `importStatus` stuck at `Scheduled`,
+  or `Category: TaskScheduling` errors in `logs bc`.
+- **Uploads use a rewritten package copy** with `MinCountForAsyncImport="2147483647"`; BC's parallel
+  import uses named memory-mapped files (unsupported on Linux).
+- **All automation-API calls run inside the bc container** (`Invoke-BcApi`: curl via `exec`, bodies
+  and files copied in with `cp`), never through host ports or Kiri names (30 s / 300 s cut-offs).
+- **Company creation needs Full-Text Search:** `-CompanyName` turns on `-FullTextSearch`; on ARM the
+  script builds `bclinuxenvironment/mssql:2022-cu17-fts` from its embedded Dockerfile.
+- Local test data (git-ignored): `experiments/ls-central-280-demo-data-package/`, the pharmacy release
+  folder, and `experiments/Import-ConfigPackages.prototype.ps1` (host-side prototype of the same flow).
 
 ## Repository hygiene
 
