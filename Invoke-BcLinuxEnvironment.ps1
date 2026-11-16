@@ -35,7 +35,7 @@
         -LicenseFile ./dev.bclicense -Apps './apps/a.app;./apps/b.app'
 
 .EXAMPLE
-    ./Invoke-BcLinuxEnvironment.ps1 -Name bc290 -PublishPorts:$false   # Kiri: http://dev.bc290.kiri.local, ... no ports
+    ./Invoke-BcLinuxEnvironment.ps1 -Name bc290 -PortlessRouter   # Kiri: no host ports; http://dev.bc290.kiri.local, ...
 
 .EXAMPLE
     ./Invoke-BcLinuxEnvironment.ps1 -EnvFile ./example.env
@@ -93,10 +93,11 @@ param(
     [int] $PortOffset,
     [int] $DevPort, [int] $ODataPort, [int] $ApiPort, [int] $MgmtPort, [int] $ClientPort,
     [int] $WebClientPort, [int] $SqlPort,
-    # Publish the BC/SQL ports on localhost (default). -PublishPorts:$false publishes none, so no
-    # port planning is needed; endpoints are then reached by name (Kiri: http://dev.<Name>.kiri.local
-    # ...). A port given explicitly (e.g. -SqlPort 11433) is still published.
-    [switch] $PublishPorts,
+    # Kiri only. Publish no host ports (no port planning between environments) and add a small
+    # nginx 'router' container, so every BC endpoint gets a name: bc./dev./odata./api./client.
+    # <Name>.kiri.local. Kiri routes a name to exactly one container port, hence the router.
+    # A port given explicitly (e.g. -SqlPort 11433 for SSMS) is still published.
+    [switch] $PortlessRouter,
 
     [ValidateSet('auto', 'docker', 'podman')] [string] $Engine,
     # Existing clone of MsDyn365Bc.On.Linux. Default: cached clone in ~/.bcvm/MsDyn365Bc.On.Linux.
@@ -130,6 +131,13 @@ function Write-Note([string] $Message) { Write-Host "           $Message" -Foreg
 # ---------------------------------------------------------------------------
 # Settings resolution: defaults < env file < BCVM_* env vars < parameters
 # ---------------------------------------------------------------------------
+# A switch written as -WebClient:$false in zsh/bash without quotes reaches pwsh as '-WebClient:'
+# ($false expanded to nothing), which PowerShell silently ignores, keeping the default. Refuse it.
+$emptySwitch = @([Environment]::GetCommandLineArgs() | Where-Object { $_ -match '^-[A-Za-z]+:$' })
+if ($emptySwitch) {
+    throw "$($emptySwitch[0]) has no value: the shell expanded `$false to nothing. Write it as $($emptySwitch[0])false (or quote '$($emptySwitch[0])`$false')."
+}
+
 $defaults = [ordered]@{
     Name                  = 'bc'
     BcVersion             = 'latest'
@@ -143,7 +151,7 @@ $defaults = [ordered]@{
     Apps                  = @()
     LicenseFile           = ''
     PortOffset            = 0
-    PublishPorts          = $true
+    PortlessRouter        = $false
     Engine                = 'auto'
     RepoPath              = ''
     RepoRef               = 'master'
@@ -163,7 +171,7 @@ $keyMap = @{
     BC_ARTIFACT_URL = 'ArtifactUrl'; BC_SERVER_USERNAME = 'Username'; BC_SERVER_PASSWORD = 'Password'
     SA_PASSWORD = 'SaPassword'; BC_WEBCLIENT = 'WebClient'; APPS = 'Apps'
     LICENSE_FILE = 'LicenseFile'; BC_LICENSE_HOST_PATH = 'LicenseFile'
-    PUBLISH_PORTS = 'PublishPorts'; PORT_OFFSET = 'PortOffset'; BC_DEV_PORT = 'DevPort'; BC_ODATA_PORT = 'ODataPort'; BC_API_PORT = 'ApiPort'
+    PORTLESS_ROUTER = 'PortlessRouter'; PORT_OFFSET = 'PortOffset'; BC_DEV_PORT = 'DevPort'; BC_ODATA_PORT = 'ODataPort'; BC_API_PORT = 'ApiPort'
     BC_MGMT_PORT = 'MgmtPort'; BC_CLIENT_PORT = 'ClientPort'; BC_WEBCLIENT_PORT = 'WebClientPort'; SQL_PORT = 'SqlPort'
     ENGINE = 'Engine'; REPO_PATH = 'RepoPath'; REPO_REF = 'RepoRef'
     BC_RUNNER_IMAGE = 'BcImage'; BC_SQL_IMAGE = 'SqlImage'; MSSQL_MEMORY_LIMIT_MB = 'SqlMemoryMB'
@@ -177,7 +185,7 @@ $passThroughEnv = [ordered]@{}
 
 function ConvertTo-Setting([string] $Key, [string] $Value) {
     switch ($Key) {
-        { $_ -in 'WebClient', 'PersistDatabase', 'PublishPorts', 'FullTextSearch' } { return $Value -match '^(1|true|yes|on)$' }
+        { $_ -in 'WebClient', 'PersistDatabase', 'PortlessRouter', 'FullTextSearch' } { return $Value -match '^(1|true|yes|on)$' }
         { $_ -in 'Apps', 'ConfigPackages' } { return @($Value -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
         { $_ -in 'PortOffset', 'DevPort', 'ODataPort', 'ApiPort', 'MgmtPort', 'ClientPort', 'WebClientPort', 'SqlPort', 'SqlMemoryMB', 'TimeoutMinutes', 'PublishTimeoutSeconds' } { return [int] $Value }
         default { return $Value }
@@ -213,8 +221,8 @@ $explicitPorts = @($ports.Keys | Where-Object { $cfg.Contains($_) -and $cfg[$_] 
 foreach ($k in @($ports.Keys)) {
     $ports[$k] = if ($k -in $explicitPorts) { [int] $cfg[$k] } else { $ports[$k] + [int] $cfg.PortOffset }
 }
-# Host ports actually published: all of them, or with -PublishPorts:$false only explicit ones.
-$publishedPorts = if ($cfg.PublishPorts) { @($ports.Keys) } else { $explicitPorts }
+# Host ports actually published: all of them, or with -PortlessRouter only explicit ones.
+$publishedPorts = if ($cfg.PortlessRouter) { $explicitPorts } else { @($ports.Keys) }
 
 $n = $cfg.Name
 if ($n -cnotmatch '^[a-z0-9][a-z0-9_-]*$') { throw "Invalid -Name '$n' (compose project names: lowercase letters, digits, '_', '-')." }
@@ -286,12 +294,18 @@ $hostNames = [ordered]@{}
 if ($isKiri) {
     # .kiri.local needs 'kiri setup --domains' (writes /etc/resolver/kiri.local); .kiri.localhost always works.
     $suffix = if ($IsMacOS -and -not (Test-Path -LiteralPath '/etc/resolver/kiri.local')) { 'kiri.localhost' } else { 'kiri.local' }
-    $hostNames.WebClientPort = "bc.$n.$suffix"
-    foreach ($e in @{ DevPort = 'dev'; ODataPort = 'odata'; ApiPort = 'api'; ClientPort = 'client' }.GetEnumerator()) {
-        $hostNames[$e.Key] = "$($e.Value).$n.$suffix"
+    if ($cfg.WebClient) { $hostNames.WebClientPort = "bc.$n.$suffix" }
+    if ($cfg.PortlessRouter) {
+        foreach ($e in @{ DevPort = 'dev'; ODataPort = 'odata'; ApiPort = 'api'; ClientPort = 'client' }.GetEnumerator()) {
+            $hostNames[$e.Key] = "$($e.Value).$n.$suffix"
+        }
     }
+} elseif ($cfg.PortlessRouter) {
+    throw "-PortlessRouter needs Kiri (container names under *.kiri.local); this engine ($(if ($isPodman) { podman } else { $engineInfo.OperatingSystem })) has none. Without it, use -PortOffset to run environments side by side."
 }
-$engineDesc = if ($isPodman) { "podman $($engineInfo.version.Version)" } else { "$($engineInfo.OperatingSystem) $($engineInfo.ServerVersion)".Trim() }
+$engineDesc = if ($isPodman) { "podman $($engineInfo.version.Version)" }
+              elseif ($isKiri) { "Kiri (Docker API $($engineInfo.ServerVersion))" }
+              else { "$($engineInfo.OperatingSystem) $($engineInfo.ServerVersion)".Trim() }
 
 $r = Invoke-Engine compose version
 if ($r.ExitCode -ne 0) {
@@ -547,7 +561,7 @@ if ($bcExtraEnv.Count) {
     foreach ($k in $bcExtraEnv.Keys) { $yaml.Add("      $($k): $(ConvertTo-YamlScalar $bcExtraEnv[$k])") }
 }
 $containerPorts = @{ DevPort = 7049; ODataPort = 7048; ApiPort = 7052; MgmtPort = 7045; ClientPort = 7085; WebClientPort = 8080 }
-if (-not $cfg.PublishPorts) {
+if ($cfg.PortlessRouter) {
     # Replace upstream's port list with only the explicitly requested ports (Compose >= 2.24).
     $list = @($publishedPorts | Where-Object { $containerPorts.Contains($_) } | ForEach-Object { '"{0}:{1}"' -f $ports[$_], $containerPorts[$_] })
     $yaml.Add("    ports: !override [$($list -join ', ')]")
@@ -558,7 +572,7 @@ if ($isKiri -and $cfg.WebClient) {
 }
 $yaml.Add('  sql:')
 $yaml.Add('    restart: unless-stopped')
-if (-not $cfg.PublishPorts) {
+if ($cfg.PortlessRouter) {
     $sqlPorts = if ('SqlPort' -in $publishedPorts) { '"{0}:1433"' -f $ports.SqlPort } else { '' }
     $yaml.Add("    ports: !override [$sqlPorts]")
 }
@@ -572,7 +586,7 @@ if ($cfg.PersistDatabase) {
     $yaml.Add('    volumes:')
     $yaml.Add('      - sql-data:/var/opt/mssql')
 }
-if ($isKiri) {
+if ($isKiri -and $cfg.PortlessRouter) {
     # Router: one nginx answering dev./odata./api./client.<Name>.kiri.local and forwarding to the bc
     # service's ports inside the compose network. Resolves 'bc' per request (Docker DNS), so it
     # starts before bc and survives bc restarts. WebSocket upgrade for client services.
@@ -620,13 +634,11 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
 $versionText = if ($cfg.ArtifactUrl) { $cfg.ArtifactUrl } else { "$($cfg.BcType) $($cfg.BcVersion) ($($cfg.Country))" }
 Write-Step "Creating BC environment '$n': $versionText on $engineDesc$(if ($emulated) { ' (amd64 emulation)' })"
 Write-Note "Compose files: $(($composeFiles | ForEach-Object { Split-Path -Leaf $_ }) -join ' + ')  (state: $stateDir)"
-$portText = if ($cfg.PublishPorts) {
+$portText = if (-not $cfg.PortlessRouter) {
     "dev $($ports.DevPort), OData $($ports.ODataPort), API $($ports.ApiPort), mgmt $($ports.MgmtPort), client $($ports.ClientPort), SQL $($ports.SqlPort)$(if ($cfg.WebClient) { ", web $($ports.WebClientPort)" })"
 } elseif ($publishedPorts) { "only $(($publishedPorts | ForEach-Object { "$_ $($ports[$_])" }) -join ', ')" } else { 'none published' }
-Write-Note "Ports: $portText$(if ($hostNames.Count) { "  (names: *.$n.$suffix)" })"
-if (-not $cfg.PublishPorts -and -not $hostNames.Count) {
-    Write-Warning "No ports are published and $engineDesc has no container names, so BC is reachable only from inside the compose network ($engineExe exec)."
-}
+Write-Note "Ports: $portText"
+if ($hostNames.Count) { Write-Note "Names: $(@($hostNames.Values) -join ', ')" }
 if ($licensePath) { Write-Note "License: $licensePath" }
 if ($appFiles.Count) { Write-Note "Extensions: $($appFiles.Count) to publish after startup" }
 
@@ -953,9 +965,11 @@ $summary = [ordered]@{
     Compose    = "$composeHint <logs|stop|start|ps>"
     Remove     = "./Invoke-BcLinuxEnvironment.ps1 -Name $n -Remove"
 }
-if ($hostNames.Count) {
+$alServer = if ($hostNames.Contains('DevPort')) { "http://$($hostNames.DevPort)`", `"port`": 80" }
+            elseif ('DevPort' -in $publishedPorts) { "http://localhost`", `"port`": $($ports.DevPort)" }
+if ($alServer) {
     $summary.Remove('Remove'); $summary.Remove('Compose')
-    $summary['AL launch'] = "`"server`": `"http://$($hostNames.DevPort)`", `"port`": 80, `"serverInstance`": `"BC`", `"authentication`": `"UserPassword`""
+    $summary['AL launch'] = "`"server`": `"$alServer, `"serverInstance`": `"BC`", `"authentication`": `"UserPassword`""
     $summary['Compose'] = "$composeHint <logs|stop|start|ps>"
     $summary['Remove'] = "./Invoke-BcLinuxEnvironment.ps1 -Name $n -Remove"
 }

@@ -80,12 +80,19 @@ Cross-cutting rules:
   - Unknown env-file keys and `-ContainerEnv` are passed straight to the BC container.
   - Adding a setting means touching: `param()`, `$defaults`, `$keyMap`, `ConvertTo-Setting` (if
     typed), the compose env/override generation, and the README table.
-- **Ports and names:** `-PublishPorts:$false` overrides upstream's `ports:` with `!override [...]`
-  (only explicitly given ports). On Kiri (`docker info` OperatingSystem `Kiri`) the override adds a
-  `router` service (nginx, generated `~/.bcvm/<Name>/router.conf`, label `dev.kiri.domain`) for
-  `dev./odata./api./client.<Name>.kiri.local`; `bc.<Name>.kiri.local` is the bc container (label
-  `dev.kiri.http.port: 8080`). Kiri names are HTTP on port 80 only, one container port per name.
-  Readiness and extension checks query BC with curl **inside** the bc container, never via host ports.
+- **Ports and names:** default publishes all ports. `-PortlessRouter` (Kiri only, throws elsewhere)
+  overrides upstream's `ports:` with `!override [...]` (only explicitly given ports, e.g. `-SqlPort`)
+  and adds the nginx `router` service (generated `~/.bcvm/<Name>/router.conf`, label
+  `dev.kiri.domain`) for `dev./odata./api./client.<Name>.kiri.local`. The user wants no router
+  unless asked for, hence one switch. On Kiri (`docker info` OperatingSystem `Kiri`; its
+  `ServerVersion` is the Docker API version, not Kiri's) the bc container always gets label
+  `dev.kiri.http.port: 8080`, so `bc.<Name>.kiri.local` is the web client. Kiri routes a name to
+  exactly ONE container port, HTTP on 80/443 only; `*.kiri.local` resolves to 127.0.0.1, so
+  `name.kiri.local:7048` is just localhost:7048 (verified 2026-11-16). Readiness, extension and
+  package calls run curl **inside** the bc container, never via host ports.
+- **Switch values from other shells:** `pwsh -File` accepts `-Switch:false`; unquoted `-Switch:$false`
+  in zsh/bash arrives as `-Switch:` and PowerShell silently ignores it, so the script throws on any
+  `-Name:` command-line argument with an empty value. Inside PowerShell only `:$false` works.
 - **Compose layering:**
   - Files: upstream `docker-compose.yml`, plus `docker-compose.macos.yml` when emulated, plus the
     generated `~/.bcvm/<Name>/compose.override.yml`.

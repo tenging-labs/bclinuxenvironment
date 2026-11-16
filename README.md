@@ -159,15 +159,17 @@ bclinux -Name bc285 -BcVersion 28.5 -Country w1 \
 
 bclinux -Name bc290 -BcVersion 29.0 -PortOffset 100
 bclinux -EnvFile ./my.local.env -PortOffset 200
-bclinux -Name bc285de -BcVersion 28.5 -Country de -Apps ./apps '-WebClient:$false'
+bclinux -Name bc285de -BcVersion 28.5 -Country de -Apps ./apps -WebClient:false
 bclinux -Name bc290 -Remove
 ```
 
 Quoting in zsh/bash:
 
 - Line continuation is `\` (PowerShell uses a backtick).
-- Put **single quotes** around anything with spaces, and around `'-WebClient:$false'` /
-  `'-PersistDatabase:$false'`. Without them the shell expands `$false` to an empty string.
+- Turn a switch off with **`-WebClient:false`** (no `$`); `pwsh -File` accepts it in every shell.
+  (Inside PowerShell itself it is `-WebClient:$false`; `:false` is an error there.)
+  Unquoted `-WebClient:$false` loses its value (the shell expands `$false` to nothing), and the script
+  stops with a message saying so. Put single quotes around anything with spaces.
 - `;` must be inside the quotes; unquoted it ends the shell command.
 
 ### fish
@@ -190,8 +192,8 @@ Usage and quoting are the same as for bash. Not tested yet.
 curl -fsSL https://raw.githubusercontent.com/tenging-labs/bclinuxenvironment/main/Invoke-BcLinuxEnvironment.ps1 -o "%TEMP%\Invoke-BcLinuxEnvironment.ps1" && pwsh -NoProfile -File "%TEMP%\Invoke-BcLinuxEnvironment.ps1"
 ```
 
-Use double quotes for values with spaces (`-Apps "a.app;b.app"`). `-WebClient:$false` needs no
-quoting in cmd. Line continuation is `^`. Not tested yet.
+Use double quotes for values with spaces (`-Apps "a.app;b.app"`). Turn switches off with
+`-WebClient:false`. Line continuation is `^`. Not tested yet.
 
 ### Windows PowerShell 5.1
 
@@ -264,7 +266,7 @@ Relative paths in an env file (apps, license) are resolved against the env file'
 | `-LicenseFile` (alias `-BcLicenseHostPath`) | `BC_LICENSE_HOST_PATH` or `LICENSE_FILE` | – | `.bclicense` imported **before** the service tier starts, instead of the CRONUS demo license. Required for ISV apps such as LS Central. |
 | `-Apps` | `APPS` | – | `.app` files and/or folders, published in the given order: one string separated by `;` (`'a.app;b.app'`), or a PowerShell array. See below. |
 | `-ContainerEnv` | any other key | – | Extra environment variables for the BC container (hashtable). In an env file, every unknown key is passed through, e.g. `BC_SERVER_SETTINGS=…`. |
-| `-PublishPorts` | `PUBLISH_PORTS` (`1`/`0`) | **on** | Publish the BC and SQL ports on `localhost`. `-PublishPorts:$false` publishes none (no port planning); a port set explicitly, e.g. `-SqlPort 11433`, is still published. On Kiri the endpoints are reachable by name, see [Container names (Kiri)](#container-names-kiri). |
+| `-PortlessRouter` | `PORTLESS_ROUTER` (`1`/`0`) | off | **Kiri only.** Publish no host ports and add a small nginx `router` container, so every BC endpoint gets a name (`bc.`, `dev.`, `odata.`, `api.`, `client.<Name>.kiri.local`). Environments never collide on ports. A port given explicitly (e.g. `-SqlPort 11433`) is still published. See [Container names (Kiri)](#container-names-kiri). |
 | `-PortOffset` | `PORT_OFFSET` | `0` | Added to every default port, so several environments can run side by side. |
 | `-DevPort` `-ODataPort` `-ApiPort` `-MgmtPort` `-ClientPort` `-WebClientPort` `-SqlPort` | `BC_DEV_PORT` … `SQL_PORT` | 7049 / 7048 / 7052 / 7045 / 7085 / 8080 / 11433 | Individual host ports (override the offset). |
 | `-Engine` | `ENGINE` | `auto` | `auto` (`docker` if its CLI exists, else `podman`), `docker` or `podman`. `docker` follows its current context (`DOCKER_CONTEXT` / `docker context use`), so Kiri, OrbStack etc. need no option. |
@@ -316,37 +318,43 @@ Give each one its own name and port offset:
 On Kiri, skip the ports altogether and use names instead (next section):
 
 ```powershell
-./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -BcVersion 28.5 -PublishPorts:$false
-./Invoke-BcLinuxEnvironment.ps1 -Name bc290 -BcVersion 29.0 -PublishPorts:$false
+./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -BcVersion 28.5 -PortlessRouter
+./Invoke-BcLinuxEnvironment.ps1 -Name bc290 -BcVersion 29.0 -PortlessRouter
 ```
 
 ### Container names (Kiri)
 
 [Kiri](https://runkiri.com/) gives every container an HTTP name on port 80:
 `http://<service>.<project>.kiri.local` (or `.kiri.localhost` when local names are not turned on with
-`kiri setup --domains`). A name reaches **one** port of its container, and BC has several, so on Kiri
-the script adds a small `router` container (nginx) to the environment. The router answers one name per
-endpoint and forwards inside the compose network:
+`kiri setup --domains`). A name reaches **exactly one** port of its container. By default the script
+publishes all ports on `localhost` as usual, and the web client also gets a name:
+`http://bc.<Name>.kiri.local/` (the bc container's port 8080 is labelled for it).
+
+All `*.kiri.local` names resolve to `127.0.0.1`. A URL like `http://bc.bc285.kiri.local:7048` therefore
+reaches whatever is **published on localhost** port 7048, from any environment and with any name. Only
+port 80 (and 443 with Kiri's HTTPS) is routed by name.
+
+**`-PortlessRouter`** makes an environment fully portless: no host ports are published, and the script
+adds a small nginx `router` container that answers one name per endpoint and forwards inside the compose
+network:
 
 | Endpoint | Name (environment `bc285`) |
 |---|---|
-| Web client | `http://bc.bc285.kiri.local/` (the bc container itself, port 8080) |
+| Web client | `http://bc.bc285.kiri.local/` |
 | Dev endpoint (AL publish, symbols) | `http://dev.bc285.kiri.local/BC/dev` |
 | OData v4 | `http://odata.bc285.kiri.local/BC/ODataV4` |
 | API v2.0 | `http://api.bc285.kiri.local/BC/api/v2.0` |
 | Client services (WebSocket) | `ws://client.bc285.kiri.local/BC` |
-| SQL Server | no name: names are HTTP only. Publish it with `-SqlPort <port>`. |
+| SQL Server | no name: names are HTTP only. Add `-SqlPort <port>` to publish just that port. |
 
-The names work whether or not ports are published. With `-PublishPorts:$false`, nothing is published on
-`localhost`, so environments never collide on ports and need no `-PortOffset`. The summary at the end
-prints the names, and the AL `launch.json` values for the dev endpoint:
+Environments created this way never collide on ports and need no `-PortOffset`. The summary at the end
+prints the names and the AL `launch.json` values for the dev endpoint:
 
 ```json
 "server": "http://dev.bc285.kiri.local", "port": 80, "serverInstance": "BC", "authentication": "UserPassword"
 ```
 
-On other engines `-PublishPorts:$false` works too, but then BC is reachable only from inside the
-compose network.
+`-PortlessRouter` needs Kiri; on other engines the script stops and suggests `-PortOffset`.
 
 ---
 
