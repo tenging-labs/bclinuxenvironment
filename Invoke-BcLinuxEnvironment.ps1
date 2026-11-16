@@ -125,8 +125,179 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-function Write-Step([string] $Message) { Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] $Message" -ForegroundColor Cyan }
-function Write-Note([string] $Message) { Write-Host "           $Message" -ForegroundColor DarkGray }
+# ---------------------------------------------------------------------------
+# Progress status: ~/.bcvm/<Name>/www/status.json, for agents and the status page
+# ---------------------------------------------------------------------------
+# Written from the moment creation starts (after the 'already exists' check) until the environment
+# is ready or the run fails. Every console step/note/warning is mirrored into it. With
+# -PortlessRouter, nginx serves it as GET http://<Name>.kiri.local/api/status plus a small page.
+$status = $null; $statusFile = $null
+function Get-UtcNow { (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+function Save-Status {
+    if (-not $status) { return }
+    $status.updatedAt = Get-UtcNow
+    $tmp = "$statusFile.tmp"
+    Set-Content -LiteralPath $tmp -Value ($status | ConvertTo-Json -Depth 6) -Encoding utf8NoBOM
+    Move-Item -LiteralPath $tmp -Destination $statusFile -Force      # atomic replace: readers never see half a file
+}
+function Add-StatusLog([string] $Level, [string] $Message) {
+    if (-not $status) { return }
+    $status.log.Add([ordered]@{ time = Get-UtcNow; level = $Level; message = $Message })
+    while ($status.log.Count -gt 200) { $status.log.RemoveAt(0) }
+    Save-Status
+}
+function Set-StatusStep([string] $Title) {
+    if (-not $status) { return }
+    $now = Get-UtcNow
+    foreach ($st in $status.steps) { if ($st.status -eq 'running') { $st.status = 'done'; $st.endedAt = $now } }
+    $status.steps.Add([ordered]@{ title = $Title; status = 'running'; startedAt = $now; endedAt = $null; detail = $null })
+    $status.step = $Title; $status.detail = $null
+}
+function Set-StatusDetail([string] $Detail) {
+    if (-not $status) { return }
+    $status.detail = $Detail
+    if ($status.steps.Count) { $status.steps[$status.steps.Count - 1].detail = $Detail }
+    Save-Status
+}
+function Write-Step([string] $Message) {
+    Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] $Message" -ForegroundColor Cyan
+    Set-StatusStep $Message; Add-StatusLog 'step' $Message
+}
+function Write-Note([string] $Message) { Write-Host "           $Message" -ForegroundColor DarkGray; Add-StatusLog 'info' $Message }
+function Write-Warning([string] $Message) { Add-StatusLog 'warning' $Message; Microsoft.PowerShell.Utility\Write-Warning $Message }
+# Any terminating error marks the status failed, then propagates unchanged.
+trap {
+    if ($status -and $status.state -eq 'running') {
+        $now = Get-UtcNow
+        foreach ($st in $status.steps) { if ($st.status -eq 'running') { $st.status = 'failed'; $st.endedAt = $now } }
+        $status.state = 'failed'; $status.error = "$($_.Exception.Message)"; $status.finishedAt = $now
+        Add-StatusLog 'error' $status.error
+    }
+    break
+}
+
+# Status page served by the router (-PortlessRouter): plain HTML + JS, no external files.
+$statusPageHtml = @'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BC environment</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#667085; --line:#e4e7ec; --btn:#eef1f5;
+          --ok:#12805c; --run:#1d64d8; --bad:#c3342b; --warn:#a15c07; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111418; --card:#1a1f26; --fg:#e6e9ee; --muted:#98a2b3; --line:#2a313b; --btn:#252c36;
+            --ok:#3ccb8f; --run:#6ea8fe; --bad:#f2786e; --warn:#f0b35a; } }
+  * { box-sizing: border-box; min-width: 0; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; overflow-wrap:anywhere; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
+  .sub { color: var(--muted); margin-bottom: 16px; overflow-wrap:anywhere; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:14px; overflow:hidden; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:999px; font-weight:600; font-size:12px; color:#fff; }
+  .running { background:var(--run); } .ready { background:var(--ok); } .failed { background:var(--bad); }
+  .now { font-size:16px; font-weight:600; margin-top:8px; overflow-wrap:anywhere; }
+  .detail { color:var(--muted); overflow-wrap:anywhere; word-break:break-word; }
+  .err { color:var(--bad); font-weight:600; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .steps { display:grid; grid-template-columns: 20px minmax(0,1fr) auto; column-gap:10px; }
+  .steps > div { padding:6px 0; border-top:1px solid var(--line); overflow-wrap:anywhere; word-break:break-word; }
+  .steps .t { color:var(--muted); white-space:nowrap; text-align:right; }
+  .s-done { color:var(--ok); } .s-running { color:var(--run); } .s-failed { color:var(--bad); }
+  pre { margin:0; max-height:320px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.5 ui-monospace,Menlo,monospace; }
+  .warning { color:var(--warn); } .error { color:var(--bad); } .step { font-weight:600; }
+  a { color:var(--run); }
+  .links { display:grid; grid-template-columns: 150px minmax(0,1fr) auto; gap:8px 12px; align-items:center; }
+  .links .k { color:var(--muted); }
+  .links code { font:12.5px/1.4 ui-monospace,Menlo,monospace; overflow-wrap:anywhere; word-break:break-all; }
+  .links .b { display:flex; gap:6px; }
+  button, .open { font:12px -apple-system,"Segoe UI",sans-serif; border:1px solid var(--line); background:var(--btn); color:var(--fg);
+                  border-radius:6px; padding:3px 10px; cursor:pointer; text-decoration:none; white-space:nowrap; }
+  button:hover, .open:hover { border-color:var(--run); }
+  .hint { color:var(--muted); font-size:12px; margin-top:8px; }
+  @media (max-width: 640px) { .links { grid-template-columns: minmax(0,1fr) auto; } .links .k { grid-column: 1 / -1; margin-top:6px; } }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="name">BC environment</h1>
+  <div class="sub" id="sub">Loading…</div>
+  <div class="card">
+    <span class="badge" id="state">…</span> <span id="elapsed" class="detail"></span>
+    <div class="now" id="step"></div><div class="detail" id="detail"></div>
+    <div class="err" id="error"></div>
+  </div>
+  <div class="card" id="linksCard" hidden>
+    <h2>Services</h2>
+    <div class="links" id="links"></div>
+    <div class="hint" id="linksHint"></div>
+  </div>
+  <div class="card"><h2>Steps</h2><div class="steps" id="steps"></div></div>
+  <div class="card"><h2>Log</h2><pre id="log"></pre></div>
+  <div class="sub">JSON for agents: <a href="api/status">api/status</a></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const dur = (a, b) => { if (!a) return ''; const s = Math.max(0, Math.round(((b ? new Date(b) : new Date()) - new Date(a)) / 1000));
+  return s >= 3600 ? `${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m` : s >= 60 ? `${Math.floor(s/60)}m ${s%60}s` : `${s}s`; };
+const time = t => t ? new Date(t).toLocaleTimeString() : '';
+// Plain http is not a secure context, so navigator.clipboard may be missing: fall back to execCommand.
+async function copy(text, btn) {
+  let ok = false;
+  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); ok = true; } } catch (e) {}
+  if (!ok) { const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select(); try { ok = document.execCommand('copy'); } catch (e) {} ta.remove(); }
+  const old = btn.textContent; btn.textContent = ok ? 'Copied' : 'Copy failed'; setTimeout(() => btn.textContent = old, 1200);
+}
+let last = null, linksKey = '';
+function renderLinks(st) {
+  const links = st.links || [];
+  $('linksCard').hidden = !links.length;
+  const key = JSON.stringify(links);
+  if (key !== linksKey) {
+    linksKey = key;
+    $('links').innerHTML = links.map((l, i) => `<div class="k">${esc(l.name)}</div><code>${esc(l.url)}</code><div class="b">` +
+      (l.kind === 'http' ? `<a class="open" href="${esc(l.url)}" target="_blank" rel="noopener">Open</a>` : '') +
+      `<button data-i="${i}">Copy</button></div>`).join('');
+    $('links').querySelectorAll('button').forEach(b => b.onclick = () => copy(links[+b.dataset.i].url, b));
+  }
+  $('linksHint').textContent = st.state === 'ready' ? '' : (st.state === 'failed' ? 'The environment did not finish; services may not respond.' : 'Services respond once the environment is ready.');
+}
+function render(st) {
+  last = st;
+  document.title = `${st.name} – ${st.state}`;
+  $('name').textContent = st.name;
+  const cfg = st.settings || {};
+  $('sub').textContent = [cfg.bcType, cfg.bcVersion, cfg.country, cfg.apps ? `${cfg.apps} app(s)` : '',
+    cfg.company ? `company "${cfg.company}"` : '', cfg.configPackages ? `${cfg.configPackages} package step(s)` : ''].filter(Boolean).join(' · ');
+  $('state').textContent = st.state; $('state').className = 'badge ' + st.state;
+  $('step').textContent = st.state === 'running' ? (st.step || '') : (st.state === 'ready' ? 'Ready' : `Failed during: ${st.step || ''}`);
+  $('detail').textContent = st.detail || '';
+  $('error').textContent = st.error || '';
+  renderLinks(st);
+  $('steps').innerHTML = (st.steps || []).map(x => `<div class="s-${x.status}">${x.status === 'running' ? '●' : x.status === 'done' ? '✓' : '✗'}</div>` +
+    `<div>${esc(x.title)}${x.detail ? `<div class="detail">${esc(x.detail)}</div>` : ''}</div><div class="t">${dur(x.startedAt, x.endedAt)}</div>`).join('');
+  const atBottom = $('log').scrollTop + $('log').clientHeight >= $('log').scrollHeight - 20;
+  $('log').innerHTML = (st.log || []).slice(-80).map(l => `<span class="${l.level}">${time(l.time)}  ${esc(l.message)}</span>`).join('\n');
+  if (atBottom) $('log').scrollTop = $('log').scrollHeight;
+  tick();
+}
+function tick() { if (last) $('elapsed').textContent = 'elapsed ' + dur(last.startedAt, last.finishedAt); }
+async function poll() {
+  try {
+    const r = await fetch('api/status', { cache: 'no-store' });
+    if (r.ok) render(await r.json()); else $('sub').textContent = `Status not available (HTTP ${r.status})`;
+  } catch (e) { $('sub').textContent = 'Status not reachable'; }
+  setTimeout(poll, last && last.state !== 'running' ? 15000 : 3000);
+}
+setInterval(tick, 1000); poll();
+</script>
+</body>
+</html>
+'@
 
 # ---------------------------------------------------------------------------
 # Settings resolution: defaults < env file < BCVM_* env vars < parameters
@@ -299,6 +470,7 @@ if ($isKiri) {
         foreach ($e in @{ DevPort = 'dev'; ODataPort = 'odata'; ApiPort = 'api'; ClientPort = 'client' }.GetEnumerator()) {
             $hostNames[$e.Key] = "$($e.Value).$n.$suffix"
         }
+        $hostNames.Status = "$n.$suffix"      # status page + GET /api/status, served by the router
     }
 } elseif ($cfg.PortlessRouter) {
     throw "-PortlessRouter needs Kiri (container names under *.kiri.local); this engine ($(if ($isPodman) { podman } else { $engineInfo.OperatingSystem })) has none. Without it, use -PortOffset to run environments side by side."
@@ -408,6 +580,24 @@ if ($leftContainers -or $leftVolumes) {
         throw "Environment '$n' already exists ($what). Use -Recreate to replace it, -Remove to delete it, or another -Name."
     }
 }
+
+# Creation starts here: from now on the status file belongs to this run.
+$wwwDir = Join-Path $stateDir 'www'
+$null = New-Item -ItemType Directory -Force -Path $wwwDir
+$statusFile = Join-Path $wwwDir 'status.json'
+$status = [ordered]@{
+    schema = 1; name = $n; state = 'running'; startedAt = Get-UtcNow; updatedAt = $null; finishedAt = $null
+    step = $null; detail = $null; error = $null
+    settings = [ordered]@{
+        bcVersion = $cfg.BcVersion; country = $cfg.Country; bcType = $cfg.BcType; apps = $appFiles.Count
+        company = $(if ($cfg.CompanyName) { $cfg.CompanyName } else { $null }); configPackages = $packageSteps.Count
+        portlessRouter = [bool]$cfg.PortlessRouter
+    }
+    links = @(); steps = [Collections.Generic.List[object]]::new(); log = [Collections.Generic.List[object]]::new(); endpoints = $null
+}
+Set-Content -LiteralPath (Join-Path $wwwDir 'index.html') -Value $statusPageHtml -Encoding utf8NoBOM
+Write-Step 'Preparing'
+Write-Note "Progress: $statusFile$(if ($cfg.PortlessRouter) { '  (status page once the containers start)' })"
 
 # Upstream always publishes the web client port, so check it too.
 foreach ($p in @($publishedPorts | ForEach-Object { $ports[$_] })) {
@@ -590,10 +780,19 @@ if ($isKiri -and $cfg.PortlessRouter) {
     # Router: one nginx answering dev./odata./api./client.<Name>.kiri.local and forwarding to the bc
     # service's ports inside the compose network. Resolves 'bc' per request (Docker DNS), so it
     # starts before bc and survives bc restarts. WebSocket upgrade for client services.
-    $routerConf = Join-Path $stateDir 'router.conf'
-    $servers = foreach ($k in 'DevPort', 'ODataPort', 'ApiPort', 'ClientPort') {
+    # <Name>.kiri.local serves the status page and GET /api/status from ~/.bcvm/<Name>/www.
+    # Folders, not single files, are mounted: status.json is replaced atomically (new inode), which a
+    # single-file bind mount would not see.
+    $routerDir = Join-Path $stateDir 'router'
+    $null = New-Item -ItemType Directory -Force -Path $routerDir
+    $routerConf = Join-Path $routerDir 'default.conf'
+    $servers = @(foreach ($k in 'DevPort', 'ODataPort', 'ApiPort', 'ClientPort') {
         "server { listen 80; server_name $($hostNames[$k]); location / { set `$u http://bc:$($containerPorts[$k]); proxy_pass `$u; } }"
-    }
+    }) + @(
+        "server { listen 80; server_name $($hostNames.Status); root /usr/share/nginx/html; add_header Cache-Control `"no-store`" always;"
+        '  location = /api/status { default_type application/json; add_header Cache-Control "no-store" always; add_header Access-Control-Allow-Origin "*" always; try_files /status.json =404; }'
+        '  location / { try_files $uri /index.html; } }'
+    )
     Set-Content -LiteralPath $routerConf -Encoding utf8NoBOM -Value (@(
         '# Generated by Invoke-BcLinuxEnvironment.ps1'
         'map $http_upgrade $conn_upgrade { default upgrade; '''' close; }'
@@ -609,9 +808,10 @@ if ($isKiri -and $cfg.PortlessRouter) {
     $yaml.Add('    image: docker.io/library/nginx:alpine')
     $yaml.Add('    restart: unless-stopped')
     $yaml.Add('    volumes:')
-    $yaml.Add("      - $(ConvertTo-YamlScalar "$($routerConf):/etc/nginx/conf.d/default.conf:ro")")
+    $yaml.Add("      - $(ConvertTo-YamlScalar "$($routerDir):/etc/nginx/conf.d:ro")")
+    $yaml.Add("      - $(ConvertTo-YamlScalar "$($wwwDir):/usr/share/nginx/html:ro")")
     $yaml.Add('    labels:')
-    $yaml.Add("      dev.kiri.domain: $(ConvertTo-YamlScalar ((('DevPort', 'ODataPort', 'ApiPort', 'ClientPort') | ForEach-Object { $hostNames[$_] }) -join ','))")
+    $yaml.Add("      dev.kiri.domain: $(ConvertTo-YamlScalar ((('Status', 'DevPort', 'ODataPort', 'ApiPort', 'ClientPort') | ForEach-Object { $hostNames[$_] }) -join ','))")
     $yaml.Add('      dev.kiri.http.port: "80"')
 }
 if ($cfg.PersistDatabase) {          # top-level key, after all services
@@ -632,6 +832,28 @@ $ctx.ComposeFileArgs = @($composeFiles | ForEach-Object { '-f'; $_ }) + @('--env
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $versionText = if ($cfg.ArtifactUrl) { $cfg.ArtifactUrl } else { "$($cfg.BcType) $($cfg.BcVersion) ($($cfg.Country))" }
+if ($status) {
+    $status.settings.bcVersion = $cfg.BcVersion     # 'latest' is resolved by now
+    # Service links for the status page/agents, known before BC is up (usable once state = ready).
+    $links = [Collections.Generic.List[object]]::new()
+    function Add-StatusLink([string] $Name, [string] $Key, [string] $Path, [string] $Scheme = 'http') {
+        $url = if ($hostNames.Contains($Key)) { "$($Scheme)://$($hostNames[$Key])$Path" }
+               elseif ($Key -in $publishedPorts) { "$($Scheme)://localhost:$($ports[$Key])$Path" }
+        if ($url) { $links.Add([ordered]@{ name = $Name; url = $url; kind = $Scheme }) }
+    }
+    if ($hostNames.Contains('Status')) { $links.Add([ordered]@{ name = 'Status page'; url = "http://$($hostNames.Status)/"; kind = 'http' }) }
+    if ($cfg.WebClient) { Add-StatusLink 'Web client' WebClientPort '/' }
+    Add-StatusLink 'Dev endpoint' DevPort '/BC/dev'
+    Add-StatusLink 'OData v4' ODataPort '/BC/ODataV4'
+    Add-StatusLink 'API v2.0' ApiPort '/BC/api/v2.0'
+    Add-StatusLink 'Client services' ClientPort '/BC' 'ws'
+    if ('SqlPort' -in $publishedPorts) { $links.Add([ordered]@{ name = 'SQL Server (sa)'; url = "localhost,$($ports.SqlPort)"; kind = 'text' }) }
+    $dev = if ($hostNames.Contains('DevPort')) { "`"server`": `"http://$($hostNames.DevPort)`", `"port`": 80" }
+           elseif ('DevPort' -in $publishedPorts) { "`"server`": `"http://localhost`", `"port`": $($ports.DevPort)" }
+    if ($dev) { $links.Add([ordered]@{ name = 'AL launch.json'; url = "$dev, `"serverInstance`": `"BC`", `"authentication`": `"UserPassword`""; kind = 'text' }) }
+    $links.Add([ordered]@{ name = 'User name'; url = $cfg.Username; kind = 'text' })
+    $status.links = $links
+}
 Write-Step "Creating BC environment '$n': $versionText on $engineDesc$(if ($emulated) { ' (amd64 emulation)' })"
 Write-Note "Compose files: $(($composeFiles | ForEach-Object { Split-Path -Leaf $_ }) -join ' + ')  (state: $stateDir)"
 $portText = if (-not $cfg.PortlessRouter) {
@@ -666,6 +888,12 @@ if ($r.ExitCode -ne 0) {
     throw "compose up failed (rc=$($r.ExitCode)).$(if ($r.Output -match 'credential') { " $credHint" })`n$($r.Output)"
 }
 $bcContainer = Get-ServiceContainer bc
+if ($hostNames.Contains('Status')) {
+    Write-Host ''
+    Write-Host "  Track progress: http://$($hostNames.Status)/   (agents: http://$($hostNames.Status)/api/status)" -ForegroundColor Green
+    Write-Host ''
+    Add-StatusLog 'info' "Status page: http://$($hostNames.Status)/"
+}
 if (-not $bcContainer) { throw 'compose up returned, but no bc container exists.' }
 
 # ---------------------------------------------------------------------------
@@ -694,7 +922,7 @@ function Wait-BcReady {
         if ($resp -and $resp.value) { break }
     }
     $line = ((Invoke-Engine logs --tail 1 $bcContainer).Output -split "`n" | Select-Object -Last 1)
-    if ($line -and $line -ne $lastLine -and $line -match '^\[(entrypoint|artifacts)\]') { Write-Note $line; $lastLine = $line }
+    if ($line -and $line -ne $lastLine -and $line -match '^\[(entrypoint|artifacts)\]') { Write-Note $line; Set-StatusDetail $line; $lastLine = $line }
     if ((Get-Date) -gt $deadline) { throw "Timed out after $($cfg.TimeoutMinutes) min waiting for BC. Check: $engineExe logs $bcContainer" }
     Start-Sleep -Seconds 5
   }
@@ -787,6 +1015,7 @@ if ($appFiles.Count) {
         foreach ($app in $pending) {
             $file = Split-Path -Leaf $app
             Write-Note "publishing $file ..."
+            Set-StatusDetail "$($installed.Count + $deferred.Count + 1)/$($appFiles.Count): $file"
             $res = Publish-BcApp $app
             if ($res.Ok) { Write-Note "  OK in $($res.Seconds)s"; $installed.Add($file) }
             elseif ($res.Retry) { Write-Note '  deferred (dependency not there yet)'; $deferred.Add($app); $lastError[$app] = $res.Message }
@@ -902,7 +1131,10 @@ if ($cfg.CompanyName) {
     $cu = "$automation/companies($($company.id))"
     if ($packageSteps.Count) { Write-Step "Configuration packages: $($packageSteps.Count) step(s) into '$($cfg.CompanyName)'" }
     $totalErrors = 0
+    $stepNo = 0
     foreach ($step in $packageSteps) {
+        $stepNo++
+        Set-StatusDetail "$stepNo/$($packageSteps.Count): $(if ($step.Feature) { "feature:$($step.Feature)" } else { Split-Path -Leaf $step.Path })"
         $t = [Diagnostics.Stopwatch]::StartNew()
         if ($step.Feature) {
             $r = Invoke-BcApi POST "$cu/features('$($step.Feature)')/Microsoft.NAV.activate" @{ updateInBackground = $false; startDateTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } -TimeoutSec 3600
@@ -953,6 +1185,7 @@ function Get-Endpoint([string] $Key, [string] $Path, [string] $Scheme = 'http') 
 $summary = [ordered]@{
     Engine     = "$engineDesc (compose project '$n')"
     Version    = $versionText
+    Status     = $(if ($hostNames.Contains('Status')) { "http://$($hostNames.Status)/  (agents: /api/status; file: $statusFile)" } else { "file: $statusFile" })
     WebClient  = $(if ($cfg.WebClient) { Get-Endpoint WebClientPort '/' } else { '(disabled)' })
     Dev        = Get-Endpoint DevPort '/BC/dev'
     OData      = Get-Endpoint ODataPort '/BC/ODataV4'
@@ -974,3 +1207,12 @@ if ($alServer) {
     $summary['Remove'] = "./Invoke-BcLinuxEnvironment.ps1 -Name $n -Remove"
 }
 $summary.GetEnumerator() | Where-Object { $null -ne $_.Value } | ForEach-Object { Write-Host ('  {0,-11} {1}' -f $_.Key, $_.Value) }
+
+if ($status) {
+    $now = Get-UtcNow
+    foreach ($st in $status.steps) { if ($st.status -eq 'running') { $st.status = 'done'; $st.endedAt = $now } }
+    $status.state = 'ready'; $status.finishedAt = $now; $status.step = 'Ready'; $status.detail = $null
+    $status.endpoints = [ordered]@{}
+    foreach ($e in $summary.GetEnumerator()) { if ($null -ne $e.Value -and "$($e.Value)") { $status.endpoints[$e.Key] = "$($e.Value)" } }
+    Save-Status
+}

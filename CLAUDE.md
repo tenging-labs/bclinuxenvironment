@@ -90,6 +90,13 @@ Cross-cutting rules:
   exactly ONE container port, HTTP on 80/443 only; `*.kiri.local` resolves to 127.0.0.1, so
   `name.kiri.local:7048` is just localhost:7048 (verified 2026-11-16). Readiness, extension and
   package calls run curl **inside** the bc container, never via host ports.
+- **Progress status:** `$status` (ordered dict, script scope like `$cfg`; set only after the
+  "already exists" check) is mirrored to `~/.bcvm/<Name>/www/status.json` by `Save-Status` (temp file +
+  `Move-Item`, atomic). `Write-Step` starts a step, `Write-Note`/`Write-Warning` (shadowed) append to
+  `log`, `Set-StatusDetail` sets progress inside a step, a script-level `trap` marks `failed` and
+  rethrows. With `-PortlessRouter` the router serves the folder at `<Name>.kiri.local`
+  (`/api/status` + the embedded `$statusPageHtml`). Mount folders, never single files (atomic
+  replace = new inode). Keep `schema` and field names stable: agents depend on them.
 - **Switch values from other shells:** `pwsh -File` accepts `-Switch:false`; unquoted `-Switch:$false`
   in zsh/bash arrives as `-Switch:` and PowerShell silently ignores it, so the script throws on any
   `-Name:` command-line argument with an empty value. Inside PowerShell only `:$false` works.

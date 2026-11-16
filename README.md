@@ -356,6 +356,55 @@ prints the names and the AL `launch.json` values for the dev endpoint:
 
 `-PortlessRouter` needs Kiri; on other engines the script stops and suggests `-PortOffset`.
 
+### Progress and status (people and agents)
+
+Creating an environment takes minutes (much longer with configuration packages), so every run keeps a
+machine-readable status that people and agents can watch while it runs:
+
+| Where | What |
+|---|---|
+| `~/.bcvm/<Name>/www/status.json` | Always written, from the moment creation starts (also before containers exist, e.g. during the SQL image build). Replaced atomically, so a reader never sees half a file. |
+| `http://<Name>.kiri.local/api/status` | The same JSON over HTTP, with `-PortlessRouter` (served by the router; CORS enabled). |
+| `http://<Name>.kiri.local/` | A small status page (plain HTML, no external files) that polls the API: current step and detail, the services with **Open** / **Copy** buttons (web client, dev endpoint, OData, API, client services, SQL, AL `launch.json` values), step list with durations, and the log tail. |
+
+The script prints the file path when it starts and, with `-PortlessRouter`, the page URL as soon as the
+containers are up:
+
+```
+  Track progress: http://demo.kiri.local/   (agents: http://demo.kiri.local/api/status)
+```
+
+```json
+{
+  "schema": 1, "name": "demo", "state": "running",
+  "startedAt": "2026-11-16T10:49:09Z", "updatedAt": "…", "finishedAt": null,
+  "step": "Publishing 3 extension(s)", "detail": "2/3: LS Retail_LS Central_28.2.0.1847.app",
+  "error": null,
+  "settings": { "bcVersion": "28.5", "country": "w1", "bcType": "sandbox", "apps": 3, "company": null, "configPackages": 0, "portlessRouter": true },
+  "links": [ { "name": "Web client", "url": "http://bc.demo.kiri.local/", "kind": "http" },
+             { "name": "AL launch.json", "url": "\"server\": \"http://dev.demo.kiri.local\", \"port\": 80, …", "kind": "text" }, … ],
+  "steps": [ { "title": "Preparing", "status": "done", "startedAt": "…", "endedAt": "…", "detail": null }, … ],
+  "log": [ { "time": "…", "level": "info", "message": "…" }, … ],
+  "endpoints": null
+}
+```
+
+- **`state`**: `running`, then `ready` (with `endpoints` filled from the summary) or `failed` (with
+  `error`). A failed run keeps its status until the environment is removed or recreated.
+- **`links`** are known from the start (`kind`: `http`, `ws` or `text` for values to copy); they
+  respond once `state` is `ready`.
+- **`steps`** mirror the console steps; `detail` shows progress inside a long step (boot lines from the
+  service tier, app *i*/*n*, package step *i*/*n*). `log` keeps the last 200 lines (`step`, `info`,
+  `warning`, `error`).
+- The status file appears only after the "already exists" check, so a refused run never overwrites the
+  status of an existing environment. `-Remove` deletes it with the rest of `~/.bcvm/<Name>`.
+
+Polling example for an agent:
+
+```bash
+until curl -s http://demo.kiri.local/api/status | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s["state"], s["step"], s["detail"] or ""); sys.exit(s["state"] == "running")'; do sleep 10; done
+```
+
 ---
 
 ## Extensions
