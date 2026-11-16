@@ -1,6 +1,6 @@
 # Roadmap and findings
 
-Status as of 2026-11-14 (configuration packages done). Usage of what works today is in [README.md](../README.md).
+Status as of 2026-11-16 (configuration packages, snapshots/clones and environment administration done). Usage of what works today is in [README.md](../README.md).
 
 ## Done
 
@@ -78,9 +78,13 @@ What had to be solved on the Linux tier (upstream reports drafted, not filed yet
    table with ≥ `MinCountForAsyncImport` rows (package header attribute, default 5; the header
    overrides the package record) goes that way. Fix: upload a copy with the attribute set to
    `2147483647`, so tables import synchronously.
-4. **Slow requests through the engine's proxies.** Kiri's name router cut the ~30 s company creation
-   at 30 s (BC then cancels it), and Kiri's port forwarding drops connections idle for 300 s. All
-   package calls therefore run inside the bc container.
+4. **Slow requests through the engine's proxies.** The ~30 s company creation was cut at 30 s when sent
+   through `http://api.<name>.kiri.local` (BC then cancels it), and Kiri's port forwarding drops
+   connections idle for 300 s. All package calls therefore run inside the bc container.
+   Re-measured 2026-11-16: the Kiri **name router itself does not cut** slow responses (a test server
+   answering GET/POST after 40, 70, 320 and 620 s all returned 200). So the 30 s cut came from
+   somewhere else (client or the generated nginx config), still to be found; see "Environment
+   administration" below.
 
 Useful for diagnosis: `BC_DEBUG_FIRSTCHANCE=1` (upstream #44) shows exceptions BC normally redacts;
 the task scheduler logs as `Category: TaskScheduling`; scheduled tasks are in `[Scheduled Task]` and
@@ -101,12 +105,135 @@ Vendor-specific notes are local only (`experiments/config-packages-notes.md`).
 
 ---
 
+## Done: snapshots and clones (`-Snapshot`, `-Clone`)
+
+Implemented 2026-11-16. Usage in the README ("Snapshots and clones"). `-Snapshot` keeps the database;
+`-Clone` keeps the whole environment, so a new one starts without downloading artifacts, re-patching
+the tier or drifting to another BC build or runner image.
+
+### Where an environment's state lives
+
+| Volume (compose project `<Name>`) | Content | Size, BC 28.5 + LS Central |
+|---|---|---|
+| `sql-data` → `/var/opt/mssql` | SQL Server: `CRONUS` database (data, apps, companies, license, users) + system DBs | 1.9 GB |
+| `bc-artifacts` → `/bc/artifacts` | Downloaded app + platform artifacts, stamped `.bc-artifact-cache` | 3.2 GB |
+| `bc-service` → `/bc/service` | Patched service tier, stamped (`SERVICE_STAMP`: platform, image `StartupHook.dll`, patcher, SQL config) | 0.7 GB |
+| `bc-assembly-cache` → `/bc/assembly-cache` | Compiled (R2R) assemblies, stamped with platform + image | 0.9 GB |
+
+The bc container's writable layer holds only what the entrypoint recreates every boot (runtime DLL
+patches, `/tmp/bc-ready`), so `docker commit` isn't needed (and would miss the volumes). The upstream
+entrypoint skips work on warm volumes: artifacts whose stamp matches are not downloaded, a matching
+service stamp skips patching, and an existing `CRONUS` database is reused.
+
+### How it works
+
+- **`-Snapshot`:** `BACKUP … COPY_ONLY, COMPRESSION, CHECKSUM` in the running sql container, copied to
+  `~/.bcvm/snapshots/<snap>/database.bak`; `snapshot.json` records the exact build (from the `key=`
+  line of `/bc/artifacts/.bc-artifact-cache`), country, type, license path, user, database name, FTS,
+  companies and non-global apps.
+- **`-FromSnapshot`:** settings pinned from `snapshot.json` (an explicit different version, country,
+  type or artifact URL is refused). `compose up sql`, wait, `RESTORE … WITH REPLACE, MOVE …`, clear the
+  user's Windows Security ID, then `compose up`. The entrypoint downloads the exact build and reuses the
+  database.
+- **`-RestoreSnapshot`:** same build only; stop `bc`, restore, start `bc`, wait.
+- **`-Clone`:** volumes found through the containers' mounts (the label lookup missed a volume created
+  outside compose); `compose stop`, copy each into `bcvm-clone-<clone>-<volume>` (`run --rm … cp -a`
+  with the runner image), `compose start`, wait. `clone.json` keeps the source's settings verbatim (the
+  artifact stamp compares the request string, `args|sandbox|28.5|w1`: rewriting `28.5` to the full
+  build would re-download), the runner image by RepoDigest, the SQL image and the `sa` password (it
+  lives in the copied `master`).
+- **`-FromClone`:** creates `<Name>_<volume>` with compose labels as copies of the clone's volumes, pins
+  the image, then the normal `compose up`.
+- **Why a database moves between environments:** every environment uses the same fixed public
+  encryption key (inserted by the entrypoint), the license is re-imported from the mount at every boot
+  (the target's license wins; the snapshot's is the default), and the Windows Security ID fix is stored
+  in the database. The `Kernel32.dll` link is re-applied after readiness (it lives in `bc-service`).
+
+### Measured (2026-11-16, Kiri on Apple Silicon, BC 28.5 W1 + LS Central, pharmacy, System App)
+
+| Operation | Time | Notes |
+|---|---|---|
+| `-Snapshot` | 5 s | 749 MB file; BC keeps running |
+| `-Clone` | 145 s | volume copy 18 s (6.6 GB); the rest is the source's stop and warm restart |
+| `-FromClone` | 3.5 min to ready | copies 7 s; "Artifacts already cached — skipping download", "CRONUS already exists"; all apps installed; web client redirects to the new name |
+| `-FromSnapshot` | ~6 min | restore 15 s, then download (46 s) + cold boot like a new environment (this run took 27 min because of the memory problem below) |
+| `-RestoreSnapshot` | 228 s | restore seconds, the rest is the tier's warm boot |
+| Fresh environment, same build | ~6 min | for comparison (42 s download) |
+
+What remains in a clone start is the tier's boot and upstream's test-toolkit publishing at every start.
+
+**Memory limit found while testing:** with three BC environments running on Kiri (VM ceiling 20 GB),
+a fourth booting environment's SQL Server failed with error 701 ("insufficient system memory"), BC
+stopped during boot and the container restarted in a loop. Containers used ~10 GB, but the VM had
+15 MB available: the rest was not processes or page cache, most likely held by Kiri's balloon. After
+removing one environment, 3.5 GB came back. Plan for about 3.5–4 GB per environment.
+
+### Open
+
+- **Data encryption keys:** with `EnableEncryption`, the key file sits in the bc container, not in the
+  database. Not checked whether it is in `bc-service` (a clone would keep it) or lost.
+- **Moving clones between machines:** engine volumes are not portable; an `-ExportClone`/`-ImportClone`
+  to a `tar` (~7 GB) would be needed.
+- A shared artifact cache across environments (upstream's `BC_ARTIFACTS_DIR`) would also remove most
+  of the download cost for new environments of the same build.
+
+---
+
+## Done: environment administration (apps and configuration packages)
+
+Implemented 2026-11-16. Usage in the README ("Administering a running environment").
+
+- **Script:** `-ListApps` (`-AsJson`), `-UninstallApp`/`-UnpublishApp`/`-InstallApp` (by name, app id
+  or package id; `-DeleteData`), and `-Update` to publish `-Apps` and import `-CompanyName`/
+  `-ConfigPackages` into a running environment with the same in-container calls as at creation. Modes
+  on existing environments read the environment's settings from its `compose.env`/override.
+- **Router (`-PortlessRouter`):** `<Name>.kiri.local` forwards `/BC/api/`, `/BC/dev/` and `/BC/ODataV4/`
+  to BC with the environment's login added. `-Update` rewrites the page and router config of older
+  environments and reloads nginx.
+- **Status page:** Extensions card (install, uninstall, unpublish, publish `.app` files) and
+  Configuration packages card (company picker, create company, import and apply `.rapidstart` files,
+  apply/delete existing packages). The `MinCountForAsyncImport` rewrite runs in the browser
+  (`DecompressionStream`/`CompressionStream`, UTF-16 kept); tested in Node against the script's output
+  (identical except the attribute).
+
+### Findings
+
+- The automation API v2.0 has every action needed: `extensions` → `Microsoft.NAV.install`, `uninstall`,
+  `uninstallAndDeleteExtensionData`, `unpublish` (key `packageId`); `extensionUpload` +
+  `Microsoft.NAV.upload` (asynchronous, tenant scope; not used). Listing extensions takes ~1 s.
+- Install/uninstall of LS Central for pharmacies: 4–7 s, synchronous (HTTP 204), through the script and
+  through the router.
+- Install/uninstall/unpublish of LS Central for pharmacies: 6–8 s each; a publish of it through the
+  router (`/BC/dev/apps`): 88 s, HTTP 200. Company creation through the router: 66–110 s, HTTP 201.
+  Package NO-01 over HTTP (create, upload, import, apply): import 3 tables / 93 records, 0 errors.
+- **Kiri's 30 s cut, explained (2026-11-16).** Kiri's name router closes a request after exactly 30 s
+  without a response **when the backend keeps reading from the connection** meanwhile. nginx does
+  (it watches the client for an early close), as does a plain socket server polling `recv`; Python's
+  `http.server` and a server that just sleeps don't, which is why the earlier 620 s test passed. Not
+  related to compose, keep-alive, multiple names on the label or emulation (each tested). nginx then
+  logged 499 and aborted the upstream request, and BC cancelled the operation (the company never
+  appeared). **Fix:** `proxy_ignore_client_abort on;` in the router: nginx stops reading from the
+  client while it waits, and Kiri no longer cuts (company creation 66 s and 79 s, publish 88 s, all
+  answered). This also covers AL publishes from VS Code through `dev.<Name>.kiri.local`. The page
+  additionally falls back to waiting for the outcome if a connection is dropped. Worth reporting to
+  Kiri (draft in `experiments/upstream-issues.md`, local).
+- Containers have: bc: `curl`, `python3`, `perl`, `gzip`, .NET 8/10 runtimes, no `pwsh`; sql:
+  `python3`, `sqlcmd`; router (nginx:alpine): busybox, `nc`, `curl`.
+
+### Open
+
+- Agents using the raw HTTP API must rewrite `MinCountForAsyncImport` themselves (documented). A small
+  job runner (e.g. the bc container's `python3`) could hide that, at the cost of a second language.
+- Snapshots, clones and restores are script-only (nginx cannot run them).
+- Features (`feature:<Id>` steps) are script-only on the page.
+
+---
+
 ## Backlog / open items
 
 - **Untested platforms:** Windows (Docker Desktop), Linux (native docker), Podman (macOS
   rootful + Rosetta, Linux). The script has code paths for all of them, but only macOS +
   Docker Desktop has run.
-- **`-Remove` end to end:** not run against a full environment yet.
 - **Upstream test toolkit:** the entrypoint always installs the Microsoft test toolkit and
   its Test Runner Extension. Consider exposing a "no test toolkit" option if upstream
   supports it (e.g. `BC_SKIP_APP_PUBLISH` skips all boot-time publishing).

@@ -61,16 +61,21 @@ Relative paths resolve against `$PWD` (or the env file's folder), never the scri
 
 The script runs top to bottom in sections:
 
-1. Settings resolution
+1. Settings resolution (plus the existing environment's `compose.env` in non-create modes, and the
+   pinned settings of `-FromSnapshot`/`-FromClone`)
 2. Engine and compose detection
 3. Remove
-4. Validation
-5. Upstream repo
-6. Generated compose files
-7. Start
-8. Wait
-9. Extensions
-10. Summary
+4. Helpers (readiness, SQL, BC API, publish, backup/restore, volume copy, router files)
+5. Mode dispatch: `-List`, `-RemoveSnapshot`, `-RemoveClone`, and on an existing environment
+   `-Snapshot`, `-Clone`, `-RestoreSnapshot`, `-ListApps`, app actions — each ends with `return`
+6. Validation
+7. Create only (`if ($mode -eq 'Create')`, not indented because it holds here-strings): upstream repo,
+   generated compose files, clone volume copies, snapshot restore (SQL first), start
+8. Wait, background-task fixes, extensions, company/packages (Create and `-Update`)
+9. Summary
+
+`$mode` is `$PSCmdlet.ParameterSetName`. Helper functions must be defined before the dispatch, since
+PowerShell defines a function only when execution reaches it.
 
 Cross-cutting rules:
 
@@ -88,8 +93,12 @@ Cross-cutting rules:
   `ServerVersion` is the Docker API version, not Kiri's) the bc container always gets label
   `dev.kiri.http.port: 8080`, so `bc.<Name>.kiri.local` is the web client. Kiri routes a name to
   exactly ONE container port, HTTP on 80/443 only; `*.kiri.local` resolves to 127.0.0.1, so
-  `name.kiri.local:7048` is just localhost:7048 (verified 2026-11-16). Readiness, extension and
-  package calls run curl **inside** the bc container, never via host ports.
+  `name.kiri.local:7048` is just localhost:7048 (verified 2026-11-16). Kiri's name router closes a
+  request after 30 s without an answer if the backend reads from the connection meanwhile (nginx
+  does); the router config's `proxy_ignore_client_abort on;` stops nginx reading, which removes the
+  cut — keep it. Kiri's published ports cut idle connections at 300 s.
+  Readiness, extension and package calls from the script run curl **inside** the bc container,
+  never via host ports.
 - **Progress status:** `$status` (ordered dict, script scope like `$cfg`; set only after the
   "already exists" check) is mirrored to `~/.bcvm/<Name>/www/status.json` by `Save-Status` (temp file +
   `Move-Item`, atomic). `Write-Step` starts a step, `Write-Note`/`Write-Warning` (shadowed) append to
@@ -136,6 +145,24 @@ Cross-cutting rules:
   resolves prefixes. The full build goes into `compose.env`.
 - **Persistence:** SQL data lives in the `sql-data` volume (SQL runs as `0:0`). The upstream
   entrypoint reuses an existing `CRONUS` DB, so stop/start keeps installed apps.
+- **Snapshots (`~/.bcvm/snapshots/<snap>`):** `BACKUP … COPY_ONLY, COMPRESSION` in the sql container,
+  copied out; `snapshot.json` pins the exact build read from `/bc/artifacts/.bc-artifact-cache` (the
+  `key=` line). `-FromSnapshot` runs `compose up sql`, restores, then `up`; `Restore-BcDatabase` also
+  clears the user's Windows Security ID before the tier starts.
+- **Clones (`bcvm-clone-<clone>-<volume>` volumes + `~/.bcvm/clones/<clone>/clone.json`):** volumes
+  are found through the containers' mounts (not labels), copied with `run --rm … cp -a` using the
+  runner image. The clone keeps the source's `compose.env` values verbatim: the entrypoint's artifact
+  stamp compares the *request* (`args|sandbox|28.5|w1`), so changing `28.5` to the full build would
+  re-download. The runner image is pinned by RepoDigest (the service stamp includes the image's
+  `StartupHook.dll`), the `sa` password is forced (it lives in the copied `master`). Target volumes
+  get `com.docker.compose.project/volume` labels so compose adopts them and `-Remove` deletes them.
+- **Admin API:** with `-PortlessRouter`, `Write-RouterFiles` adds `/BC/api/`, `/BC/dev/`,
+  `/BC/ODataV4/` at `<Name>.kiri.local`, forwarded with an `Authorization` header. A location with
+  its own `proxy_set_header` loses the inherited ones, so Host/Upgrade/Connection are repeated there.
+  `proxy_pass $u` with a variable and no URI passes the original (still encoded) request URI. The
+  status page's admin cards use these paths; the `.rapidstart` rewrite runs in the browser
+  (`DecompressionStream`/`CompressionStream`, UTF-16 kept). `-Update` rewrites `index.html` and the
+  router config and reloads nginx.
 
 ## Environment facts (maintainer's test machine: Apple Silicon)
 
@@ -164,8 +191,9 @@ Working; details and root causes in `docs/ROADMAP.md`. Things that must stay in 
   or `Category: TaskScheduling` errors in `logs bc`.
 - **Uploads use a rewritten package copy** with `MinCountForAsyncImport="2147483647"`; BC's parallel
   import uses named memory-mapped files (unsupported on Linux).
-- **All automation-API calls run inside the bc container** (`Invoke-BcApi`: curl via `exec`, bodies
-  and files copied in with `cp`), never through host ports or Kiri names (30 s / 300 s cut-offs).
+- **All automation-API calls from the script run inside the bc container** (`Invoke-BcApi`: curl via
+  `exec`, bodies and files copied in with `cp`), never through host ports (300 s cut-off) or Kiri
+  names (30 s cut-off unless the backend is our router with `proxy_ignore_client_abort`).
 - **Company creation needs Full-Text Search:** `-CompanyName` turns on `-FullTextSearch`; on ARM the
   script builds `bclinuxenvironment/mssql:2022-cu17-fts` from its embedded Dockerfile.
 - Local test data (git-ignored): `experiments/ls-central-280-demo-data-package/`, the pharmacy release

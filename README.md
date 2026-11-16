@@ -281,8 +281,27 @@ Relative paths in an env file (apps, license) are resolved against the env file'
 | `-PersistDatabase` | `PERSIST_DATABASE` | on | Keep the database in a volume. `-PersistDatabase:$false` uses upstream's in-memory tmpfs database, which is lost when the SQL container stops. |
 | `-TimeoutMinutes` | `TIMEOUT_MINUTES` | `45` | Maximum wait for the service tier. |
 | `-PublishTimeoutSeconds` | `PUBLISH_TIMEOUT_SECONDS` | `3600` | Maximum time for one extension publish. |
+| `-FromSnapshot` | `FROM_SNAPSHOT` | – | Create the environment with the database of a snapshot. BC build, country, type, license and user come from the snapshot. See [Snapshots and clones](#snapshots-and-clones). |
+| `-FromClone` | `FROM_CLONE` | – | Create the environment from a clone: copies of its database, artifacts, patched service tier and compiled cache, same build and runner image. No download, no patching. |
 | `-Recreate` | – | – | Remove an existing environment of the same name first (deletes its data). |
 | `-Remove` | – | – | Tear the environment down and exit. |
+
+Operations on an environment that already exists (each one is a separate mode; combine it with
+`-Name`). They read the environment's own settings from `~/.bcvm/<Name>`, so its version, user,
+password and ports need not be repeated.
+
+| Parameter | Description |
+|---|---|
+| `-Snapshot <snap>` | Back up the database (online, seconds) to `~/.bcvm/snapshots/<snap>`. |
+| `-Clone <clone>` | Copy the whole environment into clone volumes. The environment is stopped while copying and started again. |
+| `-RestoreSnapshot <snap>` | Replace the database with a snapshot of the same BC build (service tier stopped meanwhile). |
+| `-RemoveSnapshot <snap>` / `-RemoveClone <clone>` | Delete a snapshot / a clone and its volumes (no `-Name` needed). |
+| `-List` | List environments, snapshots and clones (no `-Name` needed). |
+| `-Update` | Publish `-Apps`, create `-CompanyName` and import `-ConfigPackages` into the running environment, and refresh its status page and router (admin API) to this script's version. |
+| `-ListApps` | List the extensions (all except Microsoft's global apps). |
+| `-UninstallApp` `-UnpublishApp` `-InstallApp` | Extensions by name, app id or package id (as `-ListApps` shows them); one string separated by `;` or an array. Run in this order: uninstall, unpublish (uninstalls first), install (newest published version). |
+| `-DeleteData` | With `-UninstallApp` / `-UnpublishApp`: also delete the extension's data. |
+| `-AsJson` | JSON output for `-List` and `-ListApps`, for scripts and agents. |
 
 ### Example env file
 
@@ -348,11 +367,25 @@ network:
 | SQL Server | no name: names are HTTP only. Add `-SqlPort <port>` to publish just that port. |
 
 Environments created this way never collide on ports and need no `-PortOffset`. The summary at the end
-prints the names and the AL `launch.json` values for the dev endpoint:
+prints the names and an AL `launch.json` configuration for the dev endpoint (the status page shows
+it formatted, with a Copy button):
 
 ```json
-"server": "http://dev.bc285.kiri.local", "port": 80, "serverInstance": "BC", "authentication": "UserPassword"
+{
+    "name": "Publish",
+    "type": "al",
+    "request": "launch",
+    "server": "http://dev.bc285.kiri.local",
+    "serverInstance": "BC",
+    "port": 80,
+    "authentication": "UserPassword",
+    "launchBrowser": false,
+    "schemaUpdateMode": "ForceSync"
+}
 ```
+
+Without `-PortlessRouter` the same configuration uses `"server": "http://localhost"` and the published
+dev port.
 
 `-PortlessRouter` needs Kiri; on other engines the script stops and suggests `-PortOffset`.
 
@@ -365,7 +398,7 @@ machine-readable status that people and agents can watch while it runs:
 |---|---|
 | `~/.bcvm/<Name>/www/status.json` | Always written, from the moment creation starts (also before containers exist, e.g. during the SQL image build). Replaced atomically, so a reader never sees half a file. |
 | `http://<Name>.kiri.local/api/status` | The same JSON over HTTP, with `-PortlessRouter` (served by the router; CORS enabled). |
-| `http://<Name>.kiri.local/` | A small status page (plain HTML, no external files) that polls the API: current step and detail, the services with **Open** / **Copy** buttons (web client, dev endpoint, OData, API, client services, SQL, AL `launch.json` values), step list with durations, and the log tail. |
+| `http://<Name>.kiri.local/` | A small status page (plain HTML, no external files) that polls the API: current step and detail, the services with **Open** / **Copy** buttons (web client, dev endpoint, OData, API, client services, SQL, AL `launch.json`), step list with durations, and the log tail. Once ready it also manages extensions and configuration packages (see [Administering a running environment](#administering-a-running-environment)). |
 
 The script prints the file path when it starts and, with `-PortlessRouter`, the page URL as soon as the
 containers are up:
@@ -380,9 +413,9 @@ containers are up:
   "startedAt": "2026-11-16T10:49:09Z", "updatedAt": "…", "finishedAt": null,
   "step": "Publishing 3 extension(s)", "detail": "2/3: LS Retail_LS Central_28.2.0.1847.app",
   "error": null,
-  "settings": { "bcVersion": "28.5", "country": "w1", "bcType": "sandbox", "apps": 3, "company": null, "configPackages": 0, "portlessRouter": true },
+  "settings": { "bcVersion": "28.5", "country": "w1", "bcType": "sandbox", "apps": 3, "company": null, "configPackages": 0, "portlessRouter": true, "from": null },
   "links": [ { "name": "Web client", "url": "http://bc.demo.kiri.local/", "kind": "http" },
-             { "name": "AL launch.json", "url": "\"server\": \"http://dev.demo.kiri.local\", \"port\": 80, …", "kind": "text" }, … ],
+             { "name": "AL launch.json", "url": "{\n  \"name\": \"Publish\",\n  \"type\": \"al\", …", "kind": "text" }, … ],
   "steps": [ { "title": "Preparing", "status": "done", "startedAt": "…", "endedAt": "…", "detail": null }, … ],
   "log": [ { "time": "…", "level": "info", "message": "…" }, … ],
   "endpoints": null
@@ -480,6 +513,133 @@ Retail images and other UI-only steps are not covered.
 
 ---
 
+## Snapshots and clones
+
+Two ways to reuse an environment's state under another name:
+
+| | `-Snapshot` | `-Clone` |
+|---|---|---|
+| Contains | The BC database (companies, data, published and installed extensions, license, users) | Everything: database, downloaded artifacts, patched service tier, compiled-assembly cache |
+| Stored as | `~/.bcvm/snapshots/<snap>/database.bak` + `snapshot.json` (a file, ~0.8 GB for BC + LS Central) | Volumes `bcvm-clone-<clone>-*` in the engine + `~/.bcvm/clones/<clone>/clone.json` (~8 GB) |
+| Taking it | Online, a few seconds | The environment is stopped while its volumes are copied, then started again |
+| New environment from it | `-FromSnapshot`: downloads the artifacts of the **exact build** and boots cold, then uses the restored database | `-FromClone`: no download, no patching; the same build and runner image (pinned by digest) |
+| Reset an existing environment | `-RestoreSnapshot` (same build only) | – |
+
+```powershell
+# Database snapshot of 'demo', then a second environment with that database, then reset 'demo' to it
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -Snapshot base
+./Invoke-BcLinuxEnvironment.ps1 -Name demo2 -FromSnapshot base -PortlessRouter
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -RestoreSnapshot base
+
+# Full clone, and environments from it
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -Clone gold
+./Invoke-BcLinuxEnvironment.ps1 -Name test1 -FromClone gold -PortlessRouter
+
+# What exists, and cleaning up
+./Invoke-BcLinuxEnvironment.ps1 -List            # -AsJson for scripts
+./Invoke-BcLinuxEnvironment.ps1 -RemoveSnapshot base
+./Invoke-BcLinuxEnvironment.ps1 -RemoveClone gold
+```
+
+- **Version pinning.** A database opens only with the BC build it belongs to. A snapshot records the
+  exact build (`28.5.54151.58262`, read from the artifact cache), and `-FromSnapshot` uses it, so
+  `latest` or a newer hotfix can't creep in. A clone keeps the source's settings verbatim and its
+  artifacts; the entrypoint doesn't go to the network when its cache matches. Passing a different
+  `-BcVersion`, `-Country`, `-BcType` or `-ArtifactUrl` is an error.
+- **Taken from the snapshot/clone unless given:** license file (re-imported at boot, so it must still
+  exist), user name and password, Full-Text Search, database name. A clone also fixes the runner image
+  (registry digest), the SQL image and the `sa` password, because the copied volumes depend on them.
+- **Everything else is new:** name, ports or `-PortlessRouter`, web client URL, status page. Extensions
+  aren't republished: they are in the database. Add `-Apps` / `-CompanyName` / `-ConfigPackages` to put
+  more on top.
+- **Removing** an environment never touches snapshots or clones; `-RemoveSnapshot` / `-RemoveClone`
+  delete them.
+- **Encryption keys:** if you used BC data encryption, the key is not in the database, so values
+  encrypted in the source can't be decrypted in a snapshot's environment.
+
+---
+
+## Administering a running environment
+
+### From the script
+
+```powershell
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -ListApps                       # table; -AsJson for scripts
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -UninstallApp 'My App'          # by name, app id or package id
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -UnpublishApp 'My App' -DeleteData
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -InstallApp 'My App'
+
+# Publish more apps / import packages into the running environment (same rules as at creation)
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -Update -Apps './apps/MyApp.app'
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -Update -CompanyName 'My Demo' -ConfigPackages './packages'
+```
+
+`-Update` without anything else refreshes the status page and router configuration of an environment
+created by an older version of the script, which adds the admin cards and API below.
+
+### From the status page (people)
+
+With `-PortlessRouter`, `http://<Name>.kiri.local/` shows two more cards once the environment is ready:
+
+- **Extensions:** the extensions (Microsoft's global apps on request) with **Install**, **Uninstall**
+  and **Unpublish** (uninstalls first), and **Publish and install** for `.app` files.
+- **Configuration packages:** pick or create a company, then **Import and apply** `.rapidstart` files
+  (sorted by name, imported one after another; the `MinCountForAsyncImport` fix is applied in the
+  browser), and **Apply** / **Delete** existing packages, with tables, records, errors and status.
+
+Long operations show their elapsed time; one runs at a time.
+
+### Over HTTP (agents)
+
+The router forwards three paths at `http://<Name>.kiri.local` to BC **with the environment's login
+added**, so agents (and the page) need no credentials. The names resolve to `127.0.0.1` only; this is
+for local development environments. Slow calls are fine: company creation (~1–2 min) and publishing
+a large app answer normally (see the note on Kiri's 30 s cut-off below).
+
+| Path | Goes to |
+|---|---|
+| `/BC/api/...` | BC APIs (`/BC/api/v2.0`, automation API `/BC/api/microsoft/automation/v2.0`) |
+| `/BC/dev/...` | Dev endpoint (publish) |
+| `/BC/ODataV4/...` | OData v4 |
+
+```bash
+B=http://demo.kiri.local/BC/api/microsoft/automation/v2.0
+C=$(curl -s $B/companies | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"][0]["id"])')
+
+# Extensions: list, install / uninstall / uninstallAndDeleteExtensionData / unpublish (by packageId)
+curl -s "$B/companies($C)/extensions"
+curl -s -X POST "$B/companies($C)/extensions(<packageId>)/Microsoft.NAV.uninstall"
+
+# Publish (and install) an app; synchronous, may take minutes
+curl -s -F "file=@MyApp.app;type=application/octet-stream" 'http://demo.kiri.local/BC/dev/apps?SchemaUpdateMode=forcesync'
+
+# Company
+curl -s -X POST -H 'Content-Type: application/json' -d '{"name":"My Demo","displayName":"My Demo"}' "$B/companies($C)/automationCompanies"
+
+# Configuration package: create, upload, import, poll importStatus, apply, poll applyStatus
+P=$(curl -s -X POST -H 'Content-Type: application/json' -d '{"code":"PKG","packageName":"My package"}' \
+    "$B/companies($C)/configurationPackages" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl -s -X PATCH -H 'If-Match: *' -H 'Content-Type: application/octet-stream' --data-binary @PKG.rapidstart \
+    "$B/companies($C)/configurationPackages($P)/file('PKG')/content"
+curl -s -X POST "$B/companies($C)/configurationPackages($P)/Microsoft.NAV.import"
+curl -s "$B/companies($C)/configurationPackages($P)"      # importStatus / applyStatus: Scheduled … Completed | Error
+curl -s -X POST "$B/companies($C)/configurationPackages($P)/Microsoft.NAV.apply"
+```
+
+**Kiri's 30 s cut-off.** Kiri's name router drops a request that gets no answer within 30 s if the
+container reads from the connection meanwhile, which nginx normally does. The router is configured
+not to (`proxy_ignore_client_abort`), so requests through `<Name>.kiri.local` and the `dev.`/`api.`/
+`odata.` names (AL publishes from VS Code included) are not cut. Environments created by an older
+version of the script get this with `-Update`.
+
+Over HTTP the package file is uploaded as it is. On the Linux service tier, tables with at least
+`MinCountForAsyncImport` rows (package header, default 5) fail to import ("Named maps are not
+supported"). Set that attribute in the package's `<DataList>` header to `2147483647` before uploading,
+or use the script (`-Update -ConfigPackages`) or the page, which do it for you. Snapshots, clones and
+restores are script-only.
+
+---
+
 ## What the script does
 
 1. **Settings:** merges defaults, env file, `BCVM_*` variables and parameters.
@@ -553,6 +713,9 @@ docker compose -p bc285 \
 - **Remove:** `./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -Remove` runs `compose down -v`, then
   removes anything still labelled with the project and deletes `~/.bcvm/bc285`.
 - **Recreate:** add `-Recreate` to the create command.
+- **Snapshot, clone, reset:** see [Snapshots and clones](#snapshots-and-clones).
+- **Extensions and packages in a running environment:** see
+  [Administering a running environment](#administering-a-running-environment).
 
 ---
 
@@ -567,6 +730,7 @@ docker compose -p bc285 \
 | BC container exits with code 133 and `rosetta error` in the logs | Emulation without the .NET fixes. They are applied automatically on ARM; if you override `-ContainerEnv`, keep `DOTNET_INTERNAL_ThreadSuspendInjection=0`. |
 | ISV apps fail to publish with license / object-range errors | Pass the partner license with `-LicenseFile` / `BC_LICENSE_HOST_PATH`. |
 | `Text optimized index cannot be created … Full-Text Search component is not installed` | An app (or creating a new company) needs SQL Full-Text Search: add `-FullTextSearch` (recreate the environment, the SQL image changes). |
+| `insufficient system memory in resource pool` (SQL error 701) in `docker logs <Name>-bc-1`, "NST stopped because an app failed to publish during boot", the bc container restarting | The engine's VM is out of memory. Each BC environment needs about 3.5–4 GB (SQL is capped at `-SqlMemoryMB`, 3 GB); on Kiri the VM's ceiling is not all available at once (its memory balloon gives memory back to the Mac). Stop or remove environments you don't need, or raise the VM memory. |
 | Timeout waiting for BC | `docker logs <Name>-bc-1`. A first boot under emulation takes 3–5 min; slow artifact downloads add to that. |
 
 ---
@@ -584,7 +748,7 @@ Total 9 min:
 
 Persistence across stop/start was also verified.
 
-**Not yet tested:** Windows, Linux, Podman, and `-Remove` end to end. See [docs/ROADMAP.md](docs/ROADMAP.md).
+**Not yet tested:** Windows, Linux and Podman. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Files
 
