@@ -190,6 +190,15 @@ Implemented 2026-11-16. Usage in the README ("Administering a running environmen
 - **Router (`-PortlessRouter`):** `<Name>.kiri.local` forwards `/BC/api/`, `/BC/dev/` and `/BC/ODataV4/`
   to BC with the environment's login added. `-Update` rewrites the page and router config of older
   environments and reloads nginx.
+- **Sharing (`kiri share <Name>-router-1`):** Kiri Cloud sends `Host: localhost:<port>` with the public
+  name in `X-Forwarded-Host` and `X-Forwarded-Proto: https` (verified 2026-11-18), so a share used to hit
+  the router's `default_server` 404. The default server is now a public gateway without credentials:
+  by share-name prefix (`dev-/odata-/api-/client-/bc-<Name>`) or by path (`/BC/ODataV4/`, `/BC/api/`,
+  `/BC/dev/`, else the web client). For the web client it passes the public name as `Host`, rewrites
+  an `https://<public>` Origin to `http://` and turns `http://` redirects into `https://` (no bc
+  recreate, unlike upstream's `BC_WEBCLIENT_TRUST_FORWARDED_HEADERS`). Verified with curl: redirect,
+  sign-in, OData/API with auth, name routing, status page not exposed. Browser session (WebSocket
+  `/csh`) not yet confirmed.
 - **Status page:** Extensions card (install, uninstall, unpublish, publish `.app` files) and
   Configuration packages card (company picker, create company, import and apply `.rapidstart` files,
   apply/delete existing packages). The `MinCountForAsyncImport` rewrite runs in the browser

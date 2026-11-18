@@ -1201,11 +1201,20 @@ function Get-BcExtensionList {
 # waits for the outcome (company listed, extension installed) instead of the response.
 # Folders, not single files, are mounted: status.json is replaced atomically (new inode), which a
 # single-file bind mount would not see.
+# Sharing (kiri share <router container>): Kiri Cloud sends Host: localhost:<port> and the public name
+# in X-Forwarded-Host (X-Forwarded-Proto: https), like Codespaces (verified 2026-11-18). Any name that
+# is not a local one lands on the default server, the public gateway. It never adds credentials (the
+# status page and admin API stay local) and routes by share name (dev-/odata-/api-/client-/bc-<Name>,
+# reserved or with Kiri's random '-xxxxxx' suffix) or else by path: /BC/ODataV4/, /BC/api/,
+# /BC/dev/, anything else is the web client. For the web client it passes the public name as Host,
+# turns the browser's https Origin into http (the client compares Origin with its own http scheme
+# and rejects a mismatch) and makes its http redirects https.
 $wwwDir = Join-Path $stateDir 'www'
 $routerDir = Join-Path $stateDir 'router'
 function Write-RouterFiles {
     $null = New-Item -ItemType Directory -Force -Path $routerDir
     $backend = @{ DevPort = 7049; ODataPort = 7048; ApiPort = 7052; ClientPort = 7085 }
+    $webPort = if ($cfg.WebClient) { 8080 } else { 0 }     # 0: no web client, the gateway answers 404
     $auth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
     $headers = 'proxy_set_header Host $host; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $conn_upgrade; ' +
                "proxy_set_header Authorization `"$auth`";"
@@ -1231,7 +1240,18 @@ function Write-RouterFiles {
         # publishes). Without this, nginx would then abort the request to BC and BC would cancel it.
         'proxy_ignore_client_abort on;'
         'resolver 127.0.0.11 valid=10s;'
-        'server { listen 80 default_server; return 404; }'
+        'map $http_x_forwarded_host $pub_host { default $http_x_forwarded_host; '''' $host; }'
+        'map $http_x_forwarded_proto $pub_proto { default $http_x_forwarded_proto; '''' $scheme; }'
+        'map "$pub_host:$uri" $pub_port {'
+        $(foreach ($e in @{ dev = 7049; odata = 7048; api = 7052; client = 7085; bc = $webPort }.GetEnumerator()) {
+            "  `"~^$($e.Key)-$([regex]::Escape($n))(-[a-z0-9]+)?\.[^:]*:`" $($e.Value);"
+        })
+        '  "~^[^:]*:/BC/ODataV4/" 7048; "~^[^:]*:/BC/api/" 7052; "~^[^:]*:/BC/dev/" 7049;'
+        "  default $webPort; }"
+        'server { listen 80 default_server; if ($pub_port = 0) { return 404; }'
+        '  set $o $http_origin; if ($http_origin = "https://$pub_host") { set $o "http://$pub_host"; }'
+        '  location / { proxy_set_header Host $pub_host; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $conn_upgrade; proxy_set_header Origin $o;'
+        '    proxy_redirect http://$pub_host/ $pub_proto://$pub_host/; set $u http://bc:$pub_port; proxy_pass $u; } }'
     ) + $servers)
 }
 
@@ -2080,6 +2100,7 @@ $summary = [ordered]@{
     Version    = $versionText
     Status     = $(if ($hostNames.Contains('Status')) { "http://$($hostNames.Status)/  (agents: /api/status; file: $statusFile)" } else { "file: $statusFile" })
     Admin      = $(if ($hostNames.Contains('Status')) { "http://$($hostNames.Status)/  (extensions and packages; API: /BC/api/..., /BC/dev/... without login)" } else { $null })
+    Share      = $(if ($hostNames.Contains('Status')) { "kiri share $n-router-1  (web client at /, /BC/ODataV4, /BC/api, /BC/dev; add --name bc-$n --no-reserve etc. for one share per endpoint; never the status page or admin API)" } else { $null })
     WebClient  = $(if ($cfg.WebClient) { Get-Endpoint WebClientPort '/' } else { '(disabled)' })
     Dev        = Get-Endpoint DevPort '/BC/dev'
     OData      = Get-Endpoint ODataPort '/BC/ODataV4'

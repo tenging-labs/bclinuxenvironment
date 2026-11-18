@@ -97,6 +97,10 @@ Cross-cutting rules:
   request after 30 s without an answer if the backend reads from the connection meanwhile (nginx
   does); the router config's `proxy_ignore_client_abort on;` stops nginx reading, which removes the
   cut — keep it. Kiri's published ports cut idle connections at 300 s.
+  Kiri Cloud shares (`kiri share <Name>-router-1`) arrive with `Host: localhost:<port>` and the public
+  name in `X-Forwarded-Host`, so they land on the router's `default_server`: the public gateway (no
+  injected credentials; share-name prefix or path routing; Host/Origin/redirect fixes for the web
+  client). Never add the admin locations there.
   Readiness, extension and package calls from the script run curl **inside** the bc container,
   never via host ports.
 - **Progress status:** `$status` (ordered dict, script scope like `$cfg`; set only after the

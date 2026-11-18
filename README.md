@@ -389,6 +389,29 @@ dev port.
 
 `-PortlessRouter` needs Kiri; on other engines the script stops and suggests `-PortOffset`.
 
+#### Sharing an environment on the internet (Kiri Cloud)
+
+With `-PortlessRouter`, share the router container and people outside your network can reach BC
+through a `https://….runkiri.cloud` link while Kiri runs:
+
+```bash
+kiri share bc285-router-1                                # one link for everything, routed by path
+kiri share bc285-router-1 --name bc-bc285 --no-reserve   # or one link per endpoint, routed by name
+```
+
+| Link | Reaches |
+|---|---|
+| `https://<share>/` | Web client (sign in with the BC user) |
+| `https://<share>/BC/ODataV4/…`, `/BC/api/…`, `/BC/dev/…` | OData v4, API, dev endpoint (Basic auth with the BC user) |
+| `https://bc-<Name>-xxxxxx…`, `dev-<Name>-…`, `odata-<Name>-…`, `api-<Name>-…`, `client-<Name>-…` | That endpoint only, when shared with `--name <prefix>-<Name>` (reserved names without the random suffix work too) |
+
+The status page and its admin API are **not** shared: they add the environment's login to every
+request and stay on `http://<Name>.kiri.local`. Everything shared still asks for the BC user and
+password, so change the default `Admin123!` before sharing. Browsers first see a short Kiri Cloud
+notice page; programs can skip it with the header `kiri-skip-warning: 1`. Kiri's plan limits how many
+links can be open at once (two on the free plan), so the single path-routed link is usually the one
+to use. Environments created before this feature need `-Update` once to get the router rule.
+
 ### Progress and status (people and agents)
 
 Creating an environment takes minutes (much longer with configuration packages), so every run keeps a
