@@ -276,6 +276,7 @@ Relative paths in an env file (apps, license) are resolved against the env file'
 | `-SqlImage` | `BC_SQL_IMAGE` | upstream default | Override the SQL Server image. |
 | `-CompanyName` | `COMPANY_NAME` | – | Company for `-ConfigPackages`; created if it doesn't exist. Turns on `-FullTextSearch`. See [Company and configuration packages](#company-and-configuration-packages). |
 | `-ConfigPackages` | `CONFIG_PACKAGES` | – | RapidStart packages imported and applied into `-CompanyName` in order: `.rapidstart` files, folders (sorted by name) and `feature:<Id>` steps, one string separated by `;` (or a PowerShell array). |
+| `-RunCodeunits` | `RUN_CODEUNITS` | – | Codeunits run through the job queue as the last step, in `-CompanyName` (else the first company), in order: `<id>` or `<id>:<parameter string>` steps separated by `;` (write `;;` for a `;` inside a parameter). A failing codeunit stops the script. See [Codeunit runs (job queue)](#codeunit-runs-job-queue). |
 | `-FullTextSearch` | `FULL_TEXT_SEARCH` (`1`/`0`) | on with `-CompanyName`, else off | SQL Server with Full-Text Search (needed to create a company, and by apps using `OptimizeForTextSearch`). ARM hosts build a CU17-based image once (`bclinuxenvironment/mssql:2022-cu17-fts`, ~1 min); x86 hosts use upstream's `mssql:2022-fts`. Ignored when `-SqlImage` is set. |
 | `-SqlMemoryMB` | `MSSQL_MEMORY_LIMIT_MB` | `3072` | SQL Server memory cap. |
 | `-PersistDatabase` | `PERSIST_DATABASE` | on | Keep the database in a volume. `-PersistDatabase:$false` uses upstream's in-memory tmpfs database, which is lost when the SQL container stops. |
@@ -297,7 +298,7 @@ password and ports need not be repeated.
 | `-RestoreSnapshot <snap>` | Replace the database with a snapshot of the same BC build (service tier stopped meanwhile). |
 | `-RemoveSnapshot <snap>` / `-RemoveClone <clone>` | Delete a snapshot / a clone and its volumes (no `-Name` needed). |
 | `-List` | List environments, snapshots and clones (no `-Name` needed). |
-| `-Update` | Publish `-Apps`, create `-CompanyName` and import `-ConfigPackages` into the running environment, and refresh its status page and router (admin API) to this script's version. |
+| `-Update` | Publish `-Apps`, create `-CompanyName`, import `-ConfigPackages` and run `-RunCodeunits` in the running environment, and refresh its status page and router (admin API) to this script's version. The first `-Update` of an older environment publishes the job queue web service and restarts the service tier once. |
 | `-ListApps` | List the extensions (all except Microsoft's global apps). |
 | `-UninstallApp` `-UnpublishApp` `-InstallApp` | Extensions by name, app id or package id (as `-ListApps` shows them); one string separated by `;` or an array. Run in this order: uninstall, unpublish (uninstalls first), install (newest published version). |
 | `-DeleteData` | With `-UninstallApp` / `-UnpublishApp`: also delete the extension's data. |
@@ -421,7 +422,7 @@ machine-readable status that people and agents can watch while it runs:
 |---|---|
 | `~/.bcvm/<Name>/www/status.json` | Always written, from the moment creation starts (also before containers exist, e.g. during the SQL image build). Replaced atomically, so a reader never sees half a file. |
 | `http://<Name>.kiri.local/api/status` | The same JSON over HTTP, with `-PortlessRouter` (served by the router; CORS enabled). |
-| `http://<Name>.kiri.local/` | A small status page (plain HTML, no external files) that polls the API: current step and detail, the services with **Open** / **Copy** buttons (web client, dev endpoint, OData, API, client services, SQL, AL `launch.json`), step list with durations, and the log tail. Once ready it also manages extensions and configuration packages (see [Administering a running environment](#administering-a-running-environment)). |
+| `http://<Name>.kiri.local/` | A small status page (plain HTML, no external files) that polls the API: current step and detail, the services with **Open** / **Copy** buttons (web client, dev endpoint, OData, API, client services, SQL, AL `launch.json`), step list with durations, and the log tail. Once ready it also manages extensions, configuration packages and codeunit runs (see [Administering a running environment](#administering-a-running-environment)). |
 
 The script prints the file path when it starts and, with `-PortlessRouter`, the page URL as soon as the
 containers are up:
@@ -436,7 +437,7 @@ containers are up:
   "startedAt": "2026-11-16T10:49:09Z", "updatedAt": "…", "finishedAt": null,
   "step": "Publishing 3 extension(s)", "detail": "2/3: LS Retail_LS Central_28.2.0.1847.app",
   "error": null,
-  "settings": { "bcVersion": "28.5", "country": "w1", "bcType": "sandbox", "apps": 3, "company": null, "configPackages": 0, "portlessRouter": true, "from": null },
+  "settings": { "bcVersion": "28.5", "country": "w1", "bcType": "sandbox", "apps": 3, "company": null, "configPackages": 0, "codeunitRuns": 0, "portlessRouter": true, "from": null },
   "links": [ { "name": "Web client", "url": "http://bc.demo.kiri.local/", "kind": "http" },
              { "name": "AL launch.json", "url": "{\n  \"name\": \"Publish\",\n  \"type\": \"al\", …", "kind": "text" }, … ],
   "steps": [ { "title": "Preparing", "status": "done", "startedAt": "…", "endedAt": "…", "detail": null }, … ],
@@ -525,7 +526,7 @@ Things the script does so that packages work on the Linux service tier (details 
 
 - It enables **background tasks**, which package import and apply (and the job queue) run on: a
   `Kernel32.dll` link for the task runner, and no Windows Security ID on the login user. The first
-  run with packages restarts the service tier once for the latter.
+  run with packages, codeunit runs or `-PortlessRouter` restarts the service tier once for the latter.
 - It uploads a copy of each package with **`MinCountForAsyncImport`** raised, because BC's parallel
   table import uses named memory-mapped files, which .NET doesn't support on Linux. Tables are then
   imported one after another.
@@ -533,6 +534,57 @@ Things the script does so that packages work on the Linux service tier (details 
   forwarding or name router.
 
 Retail images and other UI-only steps are not covered.
+
+---
+
+## Codeunit runs (job queue)
+
+As the last step, after the extensions and configuration packages (or in their place), the script can
+run codeunits with parameters through BC's job queue:
+
+```powershell
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -Apps ./apps -CompanyName 'My Demo' -ConfigPackages ./packages `
+    -RunCodeunits '50100;50101:CUSTOMERS,VENDORS;50102:mode=full;;notify=no'
+```
+
+```ini
+# the same in an env file
+RUN_CODEUNITS=50100;50101:CUSTOMERS,VENDORS;50102:mode=full;;notify=no
+```
+
+- **Steps** are `<codeunit id>` or `<codeunit id>:<parameter string>`, separated by `;`, run one after
+  another. A `;` inside a parameter is written `;;` (the last step above gets `mode=full;notify=no`);
+  commas are kept. In PowerShell, an array works too (each element can hold several steps).
+- **Each step** creates a *Job Queue Entry* (object type Codeunit, the ID, the parameter in
+  *Parameter String*, at most 1 attempt), sets it to *Ready* and waits until its *Job Queue Log Entry*
+  says *Success* or *Error*. The codeunit reads its parameter like any job queue codeunit:
+
+  ```al
+  codeunit 50101 "My Setup Job"
+  {
+      TableNo = "Job Queue Entry";
+      trigger OnRun()
+      begin
+          // Rec."Parameter String" = 'CUSTOMERS,VENDORS'
+      end;
+  }
+  ```
+- **Company:** `-CompanyName` if given (created first if missing), else the first company.
+- **Errors** stop the script with BC's message. The failed entry stays in *Job Queue Entries* in BC
+  (for its error call stack or a rerun); successful one-off entries delete themselves, as usual.
+- **Timeout:** `-PublishTimeoutSeconds` per run. If a run has not started after 2 minutes, the script
+  warns that background tasks may not be running.
+
+**How:** BC's APIs can read job queue entries and restart them, but cannot create them. The script
+therefore publishes BC's standard *Job Queue Entry Card* (page 673) as the OData web service
+`bcvmJobQueueEntries`, creates the entry there (BC's own validation and triggers run), and starts it
+with API v2.0's `restart` action. The service tier only sees a new web service after a restart, so the
+first run that needs it restarts the tier once (together with the background-task fix, see above).
+That happens at creation with `-RunCodeunits`, `-CompanyName`, `-ConfigPackages` or
+`-PortlessRouter`, and on the first `-Update` of an environment made by an older script.
+
+Later, on a running environment: `-Update -RunCodeunits` from the script, the **Codeunit runs** card
+on the status page, or plain HTTP (see [Administering a running environment](#administering-a-running-environment)).
 
 ---
 
@@ -595,20 +647,27 @@ Two ways to reuse an environment's state under another name:
 # Publish more apps / import packages into the running environment (same rules as at creation)
 ./Invoke-BcLinuxEnvironment.ps1 -Name demo -Update -Apps './apps/MyApp.app'
 ./Invoke-BcLinuxEnvironment.ps1 -Name demo -Update -CompanyName 'My Demo' -ConfigPackages './packages'
+
+# Run codeunits through the job queue (in -CompanyName, else the first company); stops on the first error
+./Invoke-BcLinuxEnvironment.ps1 -Name demo -Update -RunCodeunits '50100;50101:CUSTOMERS'
 ```
 
 `-Update` without anything else refreshes the status page and router configuration of an environment
-created by an older version of the script, which adds the admin cards and API below.
+created by an older version of the script, which adds the admin cards and API below. It also publishes
+the job queue web service for codeunit runs, which restarts the service tier once (about 2 minutes).
 
 ### From the status page (people)
 
-With `-PortlessRouter`, `http://<Name>.kiri.local/` shows two more cards once the environment is ready:
+With `-PortlessRouter`, `http://<Name>.kiri.local/` shows three more cards once the environment is ready:
 
 - **Extensions:** the extensions (Microsoft's global apps on request) with **Install**, **Uninstall**
   and **Unpublish** (uninstalls first), and **Publish and install** for `.app` files.
 - **Configuration packages:** pick or create a company, then **Import and apply** `.rapidstart` files
   (sorted by name, imported one after another; the `MinCountForAsyncImport` fix is applied in the
   browser), and **Apply** / **Delete** existing packages, with tables, records, errors and status.
+- **Codeunit runs (job queue):** pick a company, type a codeunit ID and an optional parameter string,
+  **Run** and see *Success* or BC's error. The table lists the company's latest job queue log entries
+  (any job, not only these runs) with **Run again** for codeunits.
 
 Long operations show their elapsed time; one runs at a time.
 
@@ -623,7 +682,7 @@ a large app answer normally (see the note on Kiri's 30 s cut-off below).
 |---|---|
 | `/BC/api/...` | BC APIs (`/BC/api/v2.0`, automation API `/BC/api/microsoft/automation/v2.0`) |
 | `/BC/dev/...` | Dev endpoint (publish) |
-| `/BC/ODataV4/...` | OData v4 |
+| `/BC/ODataV4/...` | OData v4 (including `bcvmJobQueueEntries` for codeunit runs) |
 
 ```bash
 B=http://demo.kiri.local/BC/api/microsoft/automation/v2.0
@@ -647,7 +706,21 @@ curl -s -X PATCH -H 'If-Match: *' -H 'Content-Type: application/octet-stream' --
 curl -s -X POST "$B/companies($C)/configurationPackages($P)/Microsoft.NAV.import"
 curl -s "$B/companies($C)/configurationPackages($P)"      # importStatus / applyStatus: Scheduled … Completed | Error
 curl -s -X POST "$B/companies($C)/configurationPackages($P)/Microsoft.NAV.apply"
+
+# Codeunit run (job queue): create the entry (On Hold) through the bcvmJobQueueEntries OData service,
+# find it in API v2.0 by its ID, start it (restart = Ready + scheduled), poll its log entry
+O="http://demo.kiri.local/BC/ODataV4/Company('CRONUS%20International%20Ltd.')/bcvmJobQueueEntries"
+V=http://demo.kiri.local/BC/api/v2.0/companies\($C\)
+J=$(curl -s -X POST -H 'Content-Type: application/json' "$O" \
+    -d '{"Object_Type_to_Run":"Codeunit","Object_ID_to_Run":50100,"Parameter_String":"CUSTOMERS","Maximum_No_of_Attempts_to_Run":1}' \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["ID"])')
+E=$(curl -s "$V/jobQueueEntries?\$filter=jobQueueEntryId%20eq%20$J" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"][0]["id"])')
+curl -s -X POST "$V/jobQueueEntries($E)/Microsoft.NAV.restart"
+curl -s "$V/jobQueueLogEntries?\$filter=jobQueueEntryId%20eq%20$J"   # status: In Process, then Success | Error (errorMessage)
 ```
+
+The company in the OData path is its name (`'` doubled, URL-encoded); API v2.0 uses the same company id as
+the automation API. A successful one-off entry deletes itself, so follow the log entries, not the entry.
 
 **Kiri's 30 s cut-off.** Kiri's name router drops a request that gets no answer within 30 s if the
 container reads from the connection meanwhile, which nginx normally does. The router is configured
@@ -702,11 +775,14 @@ restores are script-only.
    and fails fast, showing the last 60 log lines, if the container stops.
 9. **Background tasks:** links `Kernel32.dll` for the task runner and clears the login user's
    Windows Security ID, so the task scheduler can run tasks (see
-   [Company and configuration packages](#company-and-configuration-packages)).
+   [Company and configuration packages](#company-and-configuration-packages)). When packages, codeunit
+   runs or the admin page need them, it also publishes the job queue web service and restarts the
+   service tier once.
 10. **Extensions:** see above.
 11. **Company and packages** (optional): creates `-CompanyName` and imports and applies
     `-ConfigPackages` in order.
-12. **Summary:** endpoints, login, installed extensions, company, and the full compose command for
+12. **Codeunit runs** (optional): runs `-RunCodeunits` through the job queue, in order.
+13. **Summary:** endpoints, login, installed extensions, company, and the full compose command for
     managing the stack.
 
 On first boot the container downloads the BC artifacts (about 2 GB), restores the demo

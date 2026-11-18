@@ -1,6 +1,6 @@
 # Roadmap and findings
 
-Status as of 2026-11-16 (configuration packages, snapshots/clones and environment administration done). Usage of what works today is in [README.md](../README.md).
+Status as of 2026-11-18 (configuration packages, snapshots/clones, environment administration and codeunit runs done). Usage of what works today is in [README.md](../README.md).
 
 ## Done
 
@@ -235,6 +235,46 @@ Implemented 2026-11-16. Usage in the README ("Administering a running environmen
   job runner (e.g. the bc container's `python3`) could hide that, at the cost of a second language.
 - Snapshots, clones and restores are script-only (nginx cannot run them).
 - Features (`feature:<Id>` steps) are script-only on the page.
+
+---
+
+## Done: codeunit runs through the job queue (`-RunCodeunits`)
+
+Implemented 2026-11-18. Usage in the README ("Codeunit runs (job queue)").
+
+- **Script:** `-RunCodeunits` / `RUN_CODEUNITS`: `<id>[:<parameter string>]` steps separated by `;`
+  (`;;` = `;` inside a parameter), run as the last step of a create or `-Update`, in `-CompanyName`
+  (else the first company). A codeunit error stops the run.
+- **Status page:** *Codeunit runs* card (company, codeunit ID, parameter, Run; latest job queue log
+  entries with Run again). **Agents:** the same three HTTP calls through the router (README).
+
+### Findings
+
+- API v2.0 has `jobQueueEntries` and `jobQueueLogEntries`, both **read-only**; the only action is
+  `restart` on an entry (`Restart()`: On Hold, then `SetStatusValue(Ready)` = default values,
+  `CalcInitialRunTime`, *Job Queue - Enqueue* = task scheduler task). The automation API has only
+  `scheduledJobs` (read-only). Nothing creates an entry.
+- **Creation:** BC's *Job Queue Entry Card* (page 673) published as OData web service
+  `bcvmJobQueueEntries` by inserting a `[Tenant Web Service]` row (column list read from
+  `sys.columns`, so new BC versions with extra columns still work). The page's `OnNewRecord` sets
+  `ID` and status *On Hold*; the table's `OnInsert` sets user and defaults; `Object ID to Run` is
+  validated (caption filled). The POST answers with `ID` (not the SystemId the API keys on), so the
+  API entry is found with `$filter=jobQueueEntryId eq <ID>`.
+- **The running tier does not see a web service inserted through SQL** (404 after 15 s); after a
+  restart it does (~100 s on Apple Silicon, BC 29.1 W1). So the service is registered right after
+  readiness and shares the one restart of the background-task fix; that restart now also happens for
+  `-RunCodeunits` and `-PortlessRouter`. Verified 2026-11-18 on BC 29.1 W1 (Kiri).
+- **Run times:** codeunit 1328 (*Top Customers By Sales Job*) Success ~4 s after `restart`; the
+  parameter string `a;b, c` arrived unchanged. Codeunit 1415 without a record: *Error* with BC's message
+  after ~4 s. A failure writes **two** log entries (the run, then the error handler's); the script and
+  page take the first finished one. With *Maximum No. of Attempts to Run* = 1 there is no retry.
+- A successful one-off entry is deleted by the dispatcher, so outcomes are read from the log entries.
+- Log entry `status` values are captions (language-dependent); the login user's language is en-US.
+
+### Open
+
+- Reports (`Object Type to Run` = Report, output type, request page) are not offered.
+- Recurring entries are not offered (the card supports them; one-off runs were the need).
 
 ---
 

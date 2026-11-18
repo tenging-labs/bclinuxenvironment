@@ -18,6 +18,8 @@
       4. Waits until the service tier is ready and answers OData.
       5. Publishes and installs extensions (.app files) through the dev endpoint, in the
          given order.
+      6. Optionally creates a company, imports configuration packages and, last, runs codeunits
+         with parameters through the job queue (-RunCodeunits).
 
     Settings come from, in increasing order of precedence:
       built-in defaults  <  -EnvFile (KEY=VALUE lines)  <  BCVM_* environment variables
@@ -56,6 +58,7 @@
     ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -ListApps
     ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -UninstallApp 'My App' -InstallApp 'Other App'
     ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -Update -Apps ./apps/MyApp.app -CompanyName Demo -ConfigPackages ./pkgs
+    ./Invoke-BcLinuxEnvironment.ps1 -Name bc285 -Update -RunCodeunits '50100;50101:CUSTOMERS'
 #>
 #Requires -Version 7.2
 [CmdletBinding(DefaultParameterSetName = 'Create')]
@@ -95,6 +98,11 @@ param(
     # and 'feature:<Id>' steps that enable a Feature Management feature at that point
     # (e.g. 'base.rapidstart;feature:SalesPrices;./ls-packages').
     [string[]] $ConfigPackages,
+    # Codeunits run through the job queue after the configuration packages, in -CompanyName (else the
+    # first company), in order: one ';' separated string or an array of '<id>' or '<id>:<parameter
+    # string>' steps (e.g. '50100;50101:CUSTOMERS'). The codeunit reads Rec."Parameter String"
+    # (TableNo = "Job Queue Entry"); write a ';' inside a parameter as ';;'.
+    [string[]] $RunCodeunits,
     # SQL Server with Full-Text Search (needed to create companies and by apps that use
     # OptimizeForTextSearch). ARM hosts build a CU17-based image once; x86 uses upstream's 2022-fts.
     [switch] $FullTextSearch,
@@ -152,7 +160,7 @@ param(
     [Parameter(ParameterSetName = 'List', Mandatory)] [switch] $List,
 
     # --- Administering an existing, running environment -Name ---
-    # Publish -Apps, create -CompanyName and import -ConfigPackages into it, and refresh its status
+    # Publish -Apps, create -CompanyName, import -ConfigPackages and run -RunCodeunits in it, and refresh its status
     # page and router configuration (admin API) to this script's version.
     [Parameter(ParameterSetName = 'Update', Mandatory)] [switch] $Update,
     # List its extensions (all except Microsoft's global ones).
@@ -321,10 +329,24 @@ $statusPageHtml = @'
     <div class="hint">Files are imported in the order chosen (sorted by name). Each upload is rewritten so BC imports every table
       synchronously (parallel import does not work on Linux).</div>
   </div>
+  <div class="card admin" id="jobCard" hidden>
+    <h2>Codeunit runs (job queue)</h2>
+    <div class="toolbar">
+      <span class="detail">Company</span> <select id="jobCompany"></select>
+      <input type="text" id="jobCodeunit" placeholder="Codeunit ID" size="10">
+      <input type="text" id="jobParam" placeholder="Parameter string (optional)" size="36" maxlength="250">
+      <button id="jobRun">Run</button>
+      <button id="jobRefresh">Refresh</button>
+    </div>
+    <div class="msg" id="jobMsg"></div>
+    <div class="tw"><table id="jobs"></table></div>
+    <div class="hint">Each run creates a job queue entry (codeunit and parameter string), sets it to Ready and waits for its log entry.
+      The codeunit reads the parameter from Rec."Parameter String" (TableNo = "Job Queue Entry"). The table shows the company's latest job queue log entries.</div>
+  </div>
   <div class="card"><h2>Steps</h2><div class="steps" id="steps"></div></div>
   <div class="card"><h2>Log</h2><pre id="log"></pre></div>
   <div class="sub">JSON for agents: <a href="api/status">api/status</a><span id="apiHint" hidden> · BC APIs without login:
-    <a href="BC/api/microsoft/automation/v2.0/companies">BC/api/…</a>, BC/dev/…, BC/ODataV4/…</span></div>
+    <a href="BC/api/microsoft/automation/v2.0/companies">BC/api/…</a>, BC/dev/…, BC/ODataV4/… (codeunit runs: ODataV4 bcvmJobQueueEntries)</span></div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -385,7 +407,7 @@ async function poll() {
 
 // ---- Administration: BC's automation API and dev endpoint, forwarded by the router with the login ----
 const API = 'BC/api/microsoft/automation/v2.0';
-const admin = { on: false, trying: false, busy: false, label: '', companies: [], apps: [], pkgs: [] };
+const admin = { on: false, trying: false, busy: false, label: '', companies: [], apps: [], pkgs: [], jobs: [] };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const q = s => String(s).replace(/'/g, "''");              // OData string literal
 async function bc(method, path, body, headers) {
@@ -433,10 +455,13 @@ async function initAdmin() {
   admin.trying = true;
   try { admin.companies = (await bc('GET', `${API}/companies`)).value; }
   catch (e) { admin.trying = false; return; }       // no admin API (environment created by an older script: run it with -Update)
-  admin.on = true; $('appsCard').hidden = false; $('pkgCard').hidden = false; $('apiHint').hidden = false;
+  admin.on = true; $('appsCard').hidden = false; $('pkgCard').hidden = false; $('jobCard').hidden = false; $('apiHint').hidden = false;
   fillCompanies();
+  const own = last && last.settings && admin.companies.find(c => c.name === last.settings.company);   // the environment's company first
+  if (own) $('jobCompany').value = own.id;
   loadApps().catch(e => say('appsMsg', e.message, 'bad'));
   loadPkgs().catch(e => say('pkgMsg', e.message, 'bad'));
+  loadJobs().catch(e => say('jobMsg', e.message, 'bad'));
 }
 
 // Extensions
@@ -520,9 +545,11 @@ $('showMs').onchange = () => loadApps().catch(e => say('appsMsg', e.message, 'ba
 
 // Companies and configuration packages
 function fillCompanies(select) {
-  const keep = select || $('company').value;
-  $('company').innerHTML = admin.companies.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
-  if (keep && admin.companies.some(c => c.id === keep)) $('company').value = keep;
+  for (const id of ['company', 'jobCompany']) {
+    const keep = (id === 'company' && select) || $(id).value;
+    $(id).innerHTML = admin.companies.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
+    if (keep && admin.companies.some(c => c.id === keep)) $(id).value = keep;
+  }
 }
 const pkgUrl = () => `${API}/companies(${$('company').value})/configurationPackages`;
 async function loadPkgs() {
@@ -659,6 +686,66 @@ $('createCompany').onclick = () => {
 };
 $('company').onchange = () => loadPkgs().catch(e => say('pkgMsg', e.message, 'bad'));
 $('pkgRefresh').onclick = () => loadPkgs().then(() => say('pkgMsg', ''), e => say('pkgMsg', e.message, 'bad'));
+// Codeunit runs: BC's APIs read job queue entries and restart them but cannot create them, so the script
+// publishes the Job Queue Entry Card as OData service bcvmJobQueueEntries. A run creates the entry there
+// (On Hold), starts it with API v2.0's restart action and follows its job queue log entry.
+const API2 = 'BC/api/v2.0';
+const jobUrl = () => `${API2}/companies(${$('jobCompany').value})`;
+const jobFilter = id => '?$filter=' + encodeURIComponent(`jobQueueEntryId eq ${id}`);
+const noDate = t => !t || t.startsWith('0001-');
+async function loadJobs() {
+  if (!$('jobCompany').value) return;
+  const logs = (await bc('GET', `${jobUrl()}/jobQueueLogEntries?$orderby=${encodeURIComponent('startDateTime desc')}&$top=20`)).value;
+  admin.jobs = logs;
+  $('jobs').innerHTML = '<tr><th>Started</th><th>Object</th><th>Parameter</th><th>Status</th><th>Duration</th><th>Error</th><th></th></tr>' +
+    logs.map((l, i) => `<tr><td>${noDate(l.startDateTime) ? '' : esc(new Date(l.startDateTime).toLocaleString())}</td>` +
+      `<td>${esc(l.objectTypeToRun)} ${l.objectIdToRun}<div class="detail">${esc(l.description)}</div></td><td>${esc(l.parameterString)}</td>` +
+      `<td class="${l.status === 'Success' ? 's-done' : l.status === 'Error' ? 'error' : 's-running'}">${esc(l.status)}</td>` +
+      `<td>${noDate(l.endDateTime) ? '' : dur(l.startDateTime, l.endDateTime)}</td><td class="detail">${esc(l.errorMessage)}</td>` +
+      `<td class="b">${l.objectTypeToRun === 'Codeunit' ? `<button data-i="${i}">Run again</button>` : ''}</td></tr>`).join('') +
+    (logs.length ? '' : '<tr><td colspan="7" class="detail">No job queue log entries in this company.</td></tr>');
+  $('jobs').querySelectorAll('button').forEach(b => b.onclick = () => { const l = admin.jobs[+b.dataset.i]; runCodeunit(l.objectIdToRun, l.parameterString || ''); });
+}
+function runCodeunit(id, param) {
+  const company = admin.companies.find(c => c.id === $('jobCompany').value);
+  if (!company) return say('jobMsg', 'Choose a company first.', 'bad');
+  run('jobMsg', `Codeunit ${id}`, async () => {
+    progress(`Codeunit ${id}: creating the job queue entry`);
+    let e;
+    try {
+      e = await post(`BC/ODataV4/Company('${encodeURIComponent(q(company.name))}')/bcvmJobQueueEntries`, {
+        Object_Type_to_Run: 'Codeunit', Object_ID_to_Run: id, Parameter_String: param, Description: `bcvm: codeunit ${id}`, Maximum_No_of_Attempts_to_Run: 1 });
+    } catch (err) {
+      if (/HTTP 404/.test(err.message)) throw new Error(`${err.message}\nThis environment has no job queue entry web service yet: run the script once with -Update.`);
+      throw err;
+    }
+    const name = `Codeunit ${id} (${e.Object_Caption_to_Run})`;
+    const entry = (await bc('GET', `${jobUrl()}/jobQueueEntries${jobFilter(e.ID)}`)).value[0];
+    if (!entry) throw new Error(`job queue entry ${e.ID} not found through API v2.0`);
+    progress(`${name}: starting`);
+    await post(`${jobUrl()}/jobQueueEntries(${entry.id})/Microsoft.NAV.restart`);
+    const t0 = Date.now();
+    for (;;) {
+      await sleep(3000);
+      const logs = (await bc('GET', `${jobUrl()}/jobQueueLogEntries${jobFilter(e.ID)}`)).value;
+      const done = logs.find(l => l.status !== 'In Process');
+      if (done) {
+        loadJobs().catch(() => {});
+        if (done.status !== 'Success') throw new Error(`${done.status}: ${done.errorMessage}`);
+        return `${name}: ${done.status}`;
+      }
+      progress(`${name}: ${logs.length ? 'running' : Date.now() - t0 > 120000 ? 'not started after 2 min (do background tasks run? see the bc container log)' : 'waiting for the task scheduler'}`);
+      if (Date.now() - t0 > 3600000) throw new Error('no result after 60 min');
+    }
+  });
+}
+$('jobRun').onclick = () => {
+  const id = $('jobCodeunit').value.trim();
+  if (!/^\d+$/.test(id)) return say('jobMsg', 'Type a codeunit ID (a number).', 'bad');
+  runCodeunit(+id, $('jobParam').value);
+};
+$('jobRefresh').onclick = () => loadJobs().then(() => say('jobMsg', ''), e => say('jobMsg', e.message, 'bad'));
+$('jobCompany').onchange = () => loadJobs().catch(e => say('jobMsg', e.message, 'bad'));
 setInterval(tick, 1000); poll();
 </script>
 </body>
@@ -700,6 +787,7 @@ $defaults = [ordered]@{
     PublishTimeoutSeconds = 3600
     CompanyName           = ''
     ConfigPackages        = @()
+    RunCodeunits          = @()
     FullTextSearch        = $null     # auto: on when CompanyName is set
     FromSnapshot          = ''
     FromClone             = ''
@@ -717,6 +805,7 @@ $keyMap = @{
     PERSIST_DATABASE = 'PersistDatabase'; TIMEOUT_MINUTES = 'TimeoutMinutes'
     PUBLISH_TIMEOUT_SECONDS = 'PublishTimeoutSeconds'
     COMPANY_NAME = 'CompanyName'; CONFIG_PACKAGES = 'ConfigPackages'; FULL_TEXT_SEARCH = 'FullTextSearch'
+    RUN_CODEUNITS = 'RunCodeunits'
     FROM_SNAPSHOT = 'FromSnapshot'; FROM_CLONE = 'FromClone'
 }
 $cfg = [ordered]@{}
@@ -1108,11 +1197,12 @@ function Publish-BcApp([string] $Path) {
 
 $automation = '/BC/api/microsoft/automation/v2.0'
 function Copy-ToBc([string] $LocalPath) {
+    $null = Invoke-Engine exec $bcContainer mkdir -p $publishDir      # e.g. the first API call of an -Update
     $remote = "$publishDir/$([guid]::NewGuid().ToString('N'))$([IO.Path]::GetExtension($LocalPath))"
     $null = Assert-Ok (Invoke-Engine cp $LocalPath "$($bcContainer):$remote") "copying $(Split-Path -Leaf $LocalPath) into $bcContainer"
     $remote
 }
-function Invoke-BcApi([string] $Method, [string] $Path, $Body, [string] $InFile, [int] $TimeoutSec = 600) {
+function Invoke-BcApi([string] $Method, [string] $Path, $Body, [string] $InFile, [int] $TimeoutSec = 600, [int] $Port = 7052) {
     $curl = @('exec', $bcContainer, 'curl', '-s', '--max-time', "$TimeoutSec", '-u', $pair, '-X', $Method, '-w', '\n%{http_code}')
     $remote = $null; $tmp = $null
     if ($null -ne $Body) {
@@ -1123,7 +1213,7 @@ function Invoke-BcApi([string] $Method, [string] $Path, $Body, [string] $InFile,
     try {
         if ($InFile) { $remote = Copy-ToBc $InFile; $curl += @('-H', "Content-Type: $type", '--data-binary', "@$remote") }
         if ($Method -in 'PATCH', 'DELETE') { $curl += @('-H', 'If-Match: *') }
-        $r = Invoke-Engine @curl "http://localhost:7052$Path"
+        $r = Invoke-Engine @curl "http://localhost:$Port$Path"
     } finally {
         if ($tmp) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
         if ($remote) { $null = Invoke-Engine exec $bcContainer rm -f $remote }
@@ -1187,6 +1277,73 @@ function Get-BcExtensionList {
                 version = "$($_.versionMajor).$($_.versionMinor).$($_.versionBuild).$($_.versionRevision)"
                 scope = "$($_.publishedAs)".Trim(); installed = [bool] $_.isInstalled; packageId = $_.packageId; id = $_.id
             } })
+    }
+}
+
+# Codeunit runs through the job queue (-RunCodeunits, status page, agents). BC's APIs read job queue
+# entries and restart them (API v2.0 jobQueueEntries, action restart) but cannot create them, so the
+# standard Job Queue Entry Card (page 673) is published as OData web service $jobQueueService: a
+# [Tenant Web Service] row, which the running tier only sees after a restart. A run creates the entry
+# through that service (status On Hold; its triggers and validation run), starts it with restart
+# (Ready + a task scheduler task) and follows its job queue log entry (In Process, then Success or
+# Error). A successful one-off entry deletes itself; a failed one stays, with its error, for a rerun.
+$jobQueueService = 'bcvmJobQueueEntries'
+$apiV2 = '/BC/api/v2.0'
+# Adds the web service if missing (column list read from the table, so it fits every BC version).
+# Returns $true when it was added: the tier must restart to see it.
+function Register-JobQueueService {
+    $q = @"
+IF NOT EXISTS (SELECT 1 FROM [Tenant Web Service] WHERE [Object Type] = 8 AND [Service Name] = N'$jobQueueService')
+BEGIN
+  DECLARE @c nvarchar(max), @v nvarchar(max);
+  SELECT @c = STRING_AGG(CAST(QUOTENAME(c.name) AS nvarchar(max)), ','),
+         @v = STRING_AGG(CAST(CASE c.name WHEN 'Object Type' THEN '8' WHEN 'Service Name' THEN 'N''$jobQueueService''' WHEN 'Object ID' THEN '673'
+                   WHEN 'Published' THEN '1' WHEN '`$systemId' THEN 'NEWID()'
+                   ELSE CASE t.name WHEN 'uniqueidentifier' THEN '''00000000-0000-0000-0000-000000000000''' WHEN 'datetime' THEN 'GETUTCDATE()'
+                        WHEN 'nvarchar' THEN 'N''''' WHEN 'varbinary' THEN 'NULL' WHEN 'image' THEN 'NULL' ELSE '0' END END AS nvarchar(max)), ',')
+  FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+  WHERE c.object_id = OBJECT_ID(N'[Tenant Web Service]') AND t.name <> 'timestamp';
+  EXEC (N'INSERT INTO [Tenant Web Service] (' + @c + N') VALUES (' + @v + N')');
+  SELECT 1
+END
+ELSE SELECT 0
+"@
+    $r = Invoke-Sql $q
+    if ($r.ExitCode -ne 0) { Write-Warning "Could not publish the job queue entry web service; codeunit runs will not work.`n$($r.Output)"; return $false }
+    "$($r.Output)".Trim() -eq '1'
+}
+# Runs one codeunit through a job queue entry in $Company (automation API company object) and waits
+# for its outcome. Throws when the run cannot be started; a codeunit error is returned (Ok = $false).
+function Invoke-BcCodeunit($Company, [int] $Id, [string] $Parameter) {
+    $t = [Diagnostics.Stopwatch]::StartNew()
+    $odata = "/BC/ODataV4/Company('$([Uri]::EscapeDataString($Company.name.Replace("'", "''")))')/$jobQueueService"
+    $r = Invoke-BcApi POST $odata ([ordered]@{
+        Object_Type_to_Run = 'Codeunit'; Object_ID_to_Run = $Id; Parameter_String = $Parameter
+        Description = "bcvm: codeunit $Id"; Maximum_No_of_Attempts_to_Run = 1 }) -Port 7048
+    if ($r.Code -eq 404) { throw "The job queue entry web service '$jobQueueService' is not available (HTTP 404). Run the script with -Update once (it publishes the service and restarts the service tier).`n$($r.Raw)" }
+    if ($r.Code -notin 200, 201 -or -not $r.Json -or -not $r.Json.ID) { throw "Creating a job queue entry for codeunit $Id failed (HTTP $($r.Code)):`n$($r.Raw)" }
+    $entryId = $r.Json.ID; $caption = $r.Json.Object_Caption_to_Run
+    $cu = "$apiV2/companies($($Company.id))"
+    $filter = '?$filter=' + [Uri]::EscapeDataString("jobQueueEntryId eq $entryId")
+    $entry = @((Invoke-BcApi GET "$cu/jobQueueEntries$filter").Json.value) | Select-Object -First 1
+    if (-not $entry) { throw "Job queue entry $entryId (codeunit $Id) not found through API v2.0." }
+    $r = Invoke-BcApi POST "$cu/jobQueueEntries($($entry.id))/Microsoft.NAV.restart"
+    if ($r.Code -notin 200, 204) { throw "Starting the job queue entry for codeunit $Id failed (HTTP $($r.Code)):`n$($r.Raw)" }
+    $deadline = (Get-Date).AddSeconds($cfg.PublishTimeoutSeconds)
+    $warned = $false
+    while ($true) {
+        Start-Sleep -Seconds 3
+        $logs = @((Invoke-BcApi GET "$cu/jobQueueLogEntries$filter").Json.value | Where-Object { $_ })
+        $done = $logs | Where-Object status -ne 'In Process' | Select-Object -First 1
+        if ($done) {
+            return [pscustomobject]@{ Ok = $done.status -eq 'Success'; Status = $done.status; Caption = $caption; Error = $done.errorMessage
+                                      Seconds = [int]$t.Elapsed.TotalSeconds; EntryId = $entryId }
+        }
+        if (-not $logs -and -not $warned -and $t.Elapsed.TotalSeconds -gt 120) {
+            $warned = $true
+            Write-Warning "Codeunit $Id has not started after 2 min. Background tasks may not run: look for 'Category: TaskScheduling' errors in the bc container's log."
+        }
+        if ((Get-Date) -gt $deadline) { throw "Codeunit $Id ($caption): no result after $($cfg.PublishTimeoutSeconds)s (-PublishTimeoutSeconds). Job queue entry: $entryId" }
     }
 }
 
@@ -1578,6 +1735,22 @@ foreach ($c in @($cfg.ConfigPackages)) {
     }
 }
 if ($packageSteps.Count -and -not $cfg.CompanyName) { throw '-ConfigPackages needs -CompanyName (the company to import into; it is created if missing).' }
+
+# Codeunit runs: '<id>[:<parameter string>]' steps separated by ';' (';;' is a ';' inside a parameter).
+# No ',' splitting as for -Apps: parameter strings may contain commas.
+$codeunitSteps = [Collections.Generic.List[object]]::new()
+foreach ($c in @($cfg.RunCodeunits)) {
+    foreach ($e in [regex]::Split("$c", '(?<!;);(?!;)')) {
+        $e = $e.Replace(';;', ';').Trim()
+        if (-not $e) { continue }
+        if ($e -notmatch '^(?:codeunit:)?(\d+)(?::(.*))?$') {
+            throw "Invalid -RunCodeunits step '$e': use '<codeunit id>' or '<codeunit id>:<parameter string>', several separated by ';'."
+        }
+        $param = "$($Matches[2])"
+        if ($param.Length -gt 250) { throw "-RunCodeunits: the parameter string for codeunit $($Matches[1]) is longer than 250 characters (Job Queue Entry `"Parameter String`")." }
+        $codeunitSteps.Add([pscustomobject]@{ Id = [int] $Matches[1]; Parameter = $param })
+    }
+}
 # Creating a company needs SQL Full-Text Search ("Text optimized index cannot be created").
 if ($null -eq $cfg.FullTextSearch) { $cfg.FullTextSearch = [bool] $cfg.CompanyName }
 
@@ -1603,7 +1776,8 @@ if ($mode -eq 'Update') {
         if ($r.ExitCode -ne 0) { Write-Warning "Reloading the router failed:`n$($r.Output)" }
         else { Write-Step "Status page and admin API refreshed: http://$($hostNames.Status)/" }
     }
-    $what = @($(if ($appFiles.Count) { "$($appFiles.Count) extension(s)" }), $(if ($cfg.CompanyName) { "company '$($cfg.CompanyName)', $($packageSteps.Count) package step(s)" })) | Where-Object { $_ }
+    $what = @($(if ($appFiles.Count) { "$($appFiles.Count) extension(s)" }), $(if ($cfg.CompanyName) { "company '$($cfg.CompanyName)', $($packageSteps.Count) package step(s)" }),
+              $(if ($codeunitSteps.Count) { "$($codeunitSteps.Count) codeunit run(s)" })) | Where-Object { $_ }
     if ($what) { Write-Step "Updating '$n': $($what -join ', ')" }
 }
 
@@ -1632,6 +1806,7 @@ $status = [ordered]@{
     settings = [ordered]@{
         bcVersion = $cfg.BcVersion; country = $cfg.Country; bcType = $cfg.BcType; apps = $appFiles.Count
         company = $(if ($cfg.CompanyName) { $cfg.CompanyName } else { $null }); configPackages = $packageSteps.Count
+        codeunitRuns = $codeunitSteps.Count
         portlessRouter = [bool]$cfg.PortlessRouter
         from = $(if ($fromInfo) { "$($fromInfo.kind) $($fromInfo.name)" } else { $null })
     }
@@ -1960,9 +2135,14 @@ if ($mode -eq 'Create') { Write-Step "Service tier ready after $([int]$sw.Elapse
 #    groups through System.DirectoryServices (kernel32 CompareString, not stubbed). A NavUserPassword
 #    user needs no SID; clearing it skips that path. Takes effect when the tier restarts.
 $null = Invoke-Engine exec $bcContainer sh -c 'test -f /bc/hook/libwin32_stubs.so && ln -sf /bc/hook/libwin32_stubs.so /bc/service/Kernel32.dll'
-if ((Clear-UserSid) -gt 0 -and ($packageSteps.Count -or $cfg.CompanyName)) {
-    # The user is cached by the running tier; restart it so the package import tasks can run now.
-    Write-Step 'Restarting the service tier so background tasks can run'
+# Background work is wanted for packages, codeunit runs, and the admin page (-PortlessRouter), which
+# offers both. Those also get the job queue entry web service (codeunit runs; see Invoke-BcCodeunit).
+$wantJobs = [bool]($packageSteps.Count -or $cfg.CompanyName -or $codeunitSteps.Count -or $cfg.PortlessRouter)
+$sidCleared = (Clear-UserSid) -gt 0
+$serviceAdded = $wantJobs -and (Register-JobQueueService)
+if ($wantJobs -and ($sidCleared -or $serviceAdded)) {
+    # The user and the web services are cached by the running tier; one restart picks up both (once).
+    Write-Step 'Restarting the service tier so background tasks and the job queue web service work (once)'
     $null = Assert-Ok (Invoke-Engine restart $bcContainer) 'restarting the bc container'
     $companies = Wait-BcReady
 }
@@ -2083,6 +2263,31 @@ if ($cfg.CompanyName) {
 }
 
 # ---------------------------------------------------------------------------
+# Codeunit runs (job queue), the last step
+# ---------------------------------------------------------------------------
+# In -CompanyName, else the first company. Each run: job queue entry with the codeunit and its
+# parameter string, set to Ready, followed until its log entry says Success or Error (see
+# Invoke-BcCodeunit). An error stops the script; the failed entry stays in BC's Job Queue Entries.
+$codeunitSummary = $null
+if ($codeunitSteps.Count) {
+    $all = @((Invoke-BcApi GET "$automation/companies").Json.value)
+    $runCompany = if ($cfg.CompanyName) { $all | Where-Object name -eq $cfg.CompanyName | Select-Object -First 1 } else { $all | Select-Object -First 1 }
+    if (-not $runCompany) { throw "Company '$($cfg.CompanyName)' not found for -RunCodeunits." }
+    Write-Step "Running $($codeunitSteps.Count) codeunit(s) through the job queue in '$($runCompany.name)'"
+    $stepNo = 0
+    foreach ($s in $codeunitSteps) {
+        $stepNo++
+        $label = "codeunit $($s.Id)$(if ($s.Parameter) { " '$($s.Parameter)'" })"
+        Set-StatusDetail "$stepNo/$($codeunitSteps.Count): $label"
+        Write-Note "running $label ..."
+        $res = Invoke-BcCodeunit $runCompany $s.Id $s.Parameter
+        if (-not $res.Ok) { throw "Codeunit $($s.Id) ($($res.Caption)) failed after $($res.Seconds)s ($($res.Status)):`n$($res.Error)`nThe job queue entry ($($res.EntryId)) stays in BC's Job Queue Entries." }
+        Write-Note "  $($res.Caption): $($res.Status) in $($res.Seconds)s"
+    }
+    $codeunitSummary = "$($codeunitSteps.Count) run(s) in '$($runCompany.name)'"
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 Write-Step $(if ($mode -eq 'Update') { "Environment '$n' updated ($([int]$sw.Elapsed.TotalMinutes) min)" } else { "Environment '$n' is ready ($([int]$sw.Elapsed.TotalMinutes) min)" })
@@ -2099,7 +2304,7 @@ $summary = [ordered]@{
     Engine     = "$engineDesc (compose project '$n')"
     Version    = $versionText
     Status     = $(if ($hostNames.Contains('Status')) { "http://$($hostNames.Status)/  (agents: /api/status; file: $statusFile)" } else { "file: $statusFile" })
-    Admin      = $(if ($hostNames.Contains('Status')) { "http://$($hostNames.Status)/  (extensions and packages; API: /BC/api/..., /BC/dev/... without login)" } else { $null })
+    Admin      = $(if ($hostNames.Contains('Status')) { "http://$($hostNames.Status)/  (extensions, packages, codeunit runs; API: /BC/api/..., /BC/dev/..., /BC/ODataV4/... without login)" } else { $null })
     Share      = $(if ($hostNames.Contains('Status')) { "kiri share $n-router-1  (web client at /, /BC/ODataV4, /BC/api, /BC/dev; add --name bc-$n --no-reserve etc. for one share per endpoint; never the status page or admin API)" } else { $null })
     WebClient  = $(if ($cfg.WebClient) { Get-Endpoint WebClientPort '/' } else { '(disabled)' })
     Dev        = Get-Endpoint DevPort '/BC/dev'
@@ -2109,6 +2314,7 @@ $summary = [ordered]@{
     Sql        = $(if ('SqlPort' -in $publishedPorts) { "localhost,$($ports.SqlPort) (sa)" } else { '(not published; -SqlPort <port> publishes it)' })
     Username   = $cfg.Username
     Company    = $(if ($cfg.CompanyName) { "$($cfg.CompanyName)$(if ($packageSummary) { "  (packages: $packageSummary)" })" } else { $null })
+    Codeunits  = $codeunitSummary
     From       = $(if ($fromInfo) { "$($fromInfo.kind) '$($fromInfo.name)' (from '$($fromInfo.source)', BC $($fromInfo.build))" } else { $null })
     Extensions = $(if ($installedNames.Count) { $installedNames -join ', ' } elseif ($installed.Count) { $installed -join ', ' } else { $null })
     Compose    = "$composeHint <logs|stop|start|ps>"

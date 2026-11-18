@@ -195,6 +195,11 @@ Working; details and root causes in `docs/ROADMAP.md`. Things that must stay in 
   or `Category: TaskScheduling` errors in `logs bc`.
 - **Uploads use a rewritten package copy** with `MinCountForAsyncImport="2147483647"`; BC's parallel
   import uses named memory-mapped files (unsupported on Linux).
+- **Codeunit runs (`-RunCodeunits`)** are the last step (after packages). API v2.0 job queue entries are
+  read-only (only `restart`), so `Register-JobQueueService` inserts a `[Tenant Web Service]` row
+  publishing page 673 as OData `bcvmJobQueueEntries`. The tier only sees it after a restart, which is
+  shared with the SID-fix restart. A run: OData POST (On Hold), API v2.0 `restart`, poll
+  `jobQueueLogEntries` by `jobQueueEntryId` (the entry deletes itself on success; a failure logs twice).
 - **All automation-API calls from the script run inside the bc container** (`Invoke-BcApi`: curl via
   `exec`, bodies and files copied in with `cp`), never through host ports (300 s cut-off) or Kiri
   names (30 s cut-off unless the backend is our router with `proxy_ignore_client_abort`).
